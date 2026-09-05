@@ -1,0 +1,59 @@
+/**
+ * Note templates. A template is a Markdown file in the workspace `Templates/`
+ * folder. When instantiated, a small set of `{{…}}` variables is substituted:
+ *   {{title}}            the new note's title (filename without .md)
+ *   {{date}}             today as YYYY-MM-DD
+ *   {{date:FORMAT}}      today with a custom format (yyyy MM dd EEE etc.)
+ *   {{time}}             now as HH:mm
+ *   {{time:FORMAT}}      now with a custom format (HH mm ss a)
+ * Unknown variables are left untouched.
+ */
+
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+const MONTHS = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'
+]
+
+const pad = (n: number): string => String(n).padStart(2, '0')
+
+/** Format a Date with a small token grammar (a practical subset of date-fns). */
+function formatDate(d: Date, fmt: string): string {
+  const h12 = d.getHours() % 12 || 12
+  // Longest tokens first so e.g. `yyyy` wins over `yy`.
+  const tokens: [RegExp, string][] = [
+    [/yyyy/g, String(d.getFullYear())],
+    [/yy/g, pad(d.getFullYear() % 100)],
+    [/MMMM/g, MONTHS[d.getMonth()]],
+    [/MMM/g, MONTHS[d.getMonth()].slice(0, 3)],
+    [/MM/g, pad(d.getMonth() + 1)],
+    [/EEEE/g, WEEKDAYS[d.getDay()]],
+    [/EEE/g, WEEKDAYS[d.getDay()].slice(0, 3)],
+    [/dd/g, pad(d.getDate())],
+    [/HH/g, pad(d.getHours())],
+    [/hh/g, pad(h12)],
+    [/mm/g, pad(d.getMinutes())],
+    [/ss/g, pad(d.getSeconds())],
+    [/\ba\b/g, d.getHours() < 12 ? 'AM' : 'PM']
+  ]
+  // Protect literal text in single quotes (date-fns convention).
+  const literals: string[] = []
+  // NUL is used as the placeholder delimiter: it is the one character a format
+  // string can't contain, so a literal can never be confused with real content.
+  const NUL = '\u0000'
+  let out = fmt.replace(/'([^']*)'/g, (_, lit: string) => {
+    literals.push(lit)
+    return `${NUL}${literals.length - 1}${NUL}`
+  })
+  for (const [re, val] of tokens) out = out.replace(re, val)
+  // eslint-disable-next-line no-control-regex
+  return out.replace(/\x00(\d+)\x00/g, (_, i: string) => literals[Number(i)])
+}
+
+export function applyTemplate(text: string, title: string, now: Date): string {
+  return text.replace(/\{\{(title|date|time)(?::([^}]+))?\}\}/g, (_, kind: string, fmt?: string) => {
+    if (kind === 'title') return title
+    if (kind === 'date') return fmt ? formatDate(now, fmt) : `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+    return fmt ? formatDate(now, fmt) : `${pad(now.getHours())}:${pad(now.getMinutes())}`
+  })
+}

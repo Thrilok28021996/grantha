@@ -1,0 +1,612 @@
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useStore, templatesFromFiles, EDITOR_FONTS, ACCENTS, type SidePane } from './store'
+import { todayISO } from './lib/dates'
+import { Sidebar } from './components/Sidebar'
+import { Backlinks } from './components/Backlinks'
+import { BlockEditor } from './components/BlockEditor'
+import { NoteTitle } from './components/NoteTitle'
+import { PropertiesPanel } from './components/PropertiesPanel'
+import { LocalGraph } from './components/LocalGraph'
+import { TableOfContents } from './components/TableOfContents'
+import { SimilarNotes } from './components/SimilarNotes'
+import { JournalView } from './components/JournalView'
+import { Calendar } from './components/Calendar'
+import { OnThisDay } from './components/OnThisDay'
+import { HistoryPanel } from './components/HistoryPanel'
+import { CommandPalette } from './components/CommandPalette'
+import { ErrorBoundary } from './components/ErrorBoundary'
+import { LinkPreview } from './components/LinkPreview'
+import { ContextMenu } from './components/ContextMenu'
+import { ResizeHandle } from './components/ResizeHandle'
+import { RightSection } from './components/RightSection'
+import { QuickTask } from './components/QuickTask'
+import { noteStats } from './lib/stats'
+import { REVEAL_LABEL } from './lib/platform'
+
+// pdfjs-dist (+ its worker) is large and only needed when a PDF opens — load it lazily.
+const PdfWorkspace = lazy(() => import('./components/PdfWorkspace').then((m) => ({ default: m.PdfWorkspace })))
+// The canvas surface is only needed in the Canvas view — load it lazily too.
+const CanvasView = lazy(() => import('./components/CanvasView').then((m) => ({ default: m.CanvasView })))
+// Every other full-screen view and modal: none of them is on the path to a first
+// paint of a note, and keeping them out of the entry chunk is what stops the app's
+// startup cost growing with each screen added. All render inside a Suspense already.
+const GraphView = lazy(() => import('./components/GraphView').then((m) => ({ default: m.GraphView })))
+const BasesView = lazy(() => import('./components/BasesView').then((m) => ({ default: m.BasesView })))
+const AssetsView = lazy(() => import('./components/AssetsView').then((m) => ({ default: m.AssetsView })))
+const TagsView = lazy(() => import('./components/TagsView').then((m) => ({ default: m.TagsView })))
+const TodosView = lazy(() => import('./components/TodosView').then((m) => ({ default: m.TodosView })))
+const TendView = lazy(() => import('./components/TendView').then((m) => ({ default: m.TendView })))
+const CompileView = lazy(() => import('./components/CompileView').then((m) => ({ default: m.CompileView })))
+const Settings = lazy(() => import('./components/Settings').then((m) => ({ default: m.Settings })))
+const Help = lazy(() => import('./components/Help').then((m) => ({ default: m.Help })))
+
+function Welcome(): React.JSX.Element {
+  const openWorkspace = useStore((s) => s.openWorkspace)
+  const openDemoVault = useStore((s) => s.openDemoVault)
+  return (
+    <div className="welcome">
+      <h1>Grantha</h1>
+      <p>
+        A local-first notebook — Markdown files, an outliner, a journal, todos, backlinks, and a
+        graph. Open a folder to begin; everything stays on your disk as plain <code>.md</code>.
+      </p>
+      <button className="btn" onClick={() => void openWorkspace()}>
+        Open a folder
+      </button>
+      <button className="btn ghost" onClick={() => void openDemoVault()}>
+        Try the demo vault
+      </button>
+    </div>
+  )
+}
+
+const VIEW_TITLE: Record<string, string> = {
+  graph: 'Graph',
+  canvas: 'Canvas',
+  database: 'Bases',
+  journal: 'Journal',
+  todos: 'Todos',
+  assets: 'Assets',
+  tags: 'Tags',
+  tend: 'Tend'
+}
+
+function TopBar(): React.JSX.Element {
+  const view = useStore((s) => s.view)
+  const activePath = useStore((s) => s.activePath)
+  const files = useStore((s) => s.files)
+  // Only the active note's text — so the word count doesn't re-render when other notes change.
+  const activeText = useStore((s) => (s.view === 'editor' && s.activePath ? s.texts[s.activePath] ?? '' : ''))
+  const goBack = useStore((s) => s.goBack)
+  const goForward = useStore((s) => s.goForward)
+  const histIndex = useStore((s) => s.histIndex)
+  const histLen = useStore((s) => s.history.length)
+  const sidebarOpen = useStore((s) => s.sidebarOpen)
+  const toggleSidebar = useStore((s) => s.toggleSidebar)
+  const rightbarOpen = useStore((s) => s.rightbarOpen)
+  const toggleRightbar = useStore((s) => s.toggleRightbar)
+  const revealNote = useStore((s) => s.revealNote)
+  const deleteNote = useStore((s) => s.deleteNote)
+  const togglePin = useStore((s) => s.togglePin)
+  const duplicateNote = useStore((s) => s.duplicateNote)
+  const applyTemplateToNote = useStore((s) => s.applyTemplateToNote)
+  const openModal = useStore((s) => s.openModal)
+  const toggleZen = useStore((s) => s.toggleZen)
+  const isPinned = useStore(
+    (s) => !!(s.activePath && (s.parsed[s.activePath]?.frontmatter as { pinned?: unknown } | undefined)?.pinned)
+  )
+  const [pageMenu, setPageMenu] = useState<{ x: number; y: number } | null>(null)
+  const [tplMenu, setTplMenu] = useState<{ x: number; y: number } | null>(null)
+  const [historyFor, setHistoryFor] = useState<string | null>(null)
+  const templates = useMemo(() => templatesFromFiles(files), [files])
+
+  const nameOf = (p: string): string => files.find((f) => f.path === p)?.name ?? p.replace(/\.md$/i, '')
+  const title = view === 'editor' ? (activePath ? nameOf(activePath) : 'No note') : VIEW_TITLE[view]
+  const stats = view === 'editor' && activePath ? noteStats(activeText) : null
+
+  return (
+    <div className="tabstrip">
+      <button
+        className="nav-btn sidebar-toggle"
+        onClick={() => toggleSidebar()}
+        title={`${sidebarOpen ? 'Hide' : 'Show'} sidebar (⌘\\)`}
+      >
+        ☰
+      </button>
+      <div className="nav-btns">
+        <button className="nav-btn" disabled={histIndex <= 0} onClick={() => goBack()} title="Back (⌘[)">
+          ‹
+        </button>
+        <button
+          className="nav-btn"
+          disabled={histIndex >= histLen - 1}
+          onClick={() => goForward()}
+          title="Forward (⌘])"
+        >
+          ›
+        </button>
+      </div>
+      <span className="topbar-title">{title}</span>
+      {stats && (
+        <span className="wc-stat" title="Word count · reading time">
+          {stats.words.toLocaleString()} words · {stats.minutes} min
+        </span>
+      )}
+      {view === 'editor' && activePath && (
+        <button
+          className="nav-btn page-menu-btn"
+          title="Page actions"
+          onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect()
+            setPageMenu({ x: r.right - 200, y: r.bottom + 4 })
+          }}
+        >
+          ⋯
+        </button>
+      )}
+      {view !== 'graph' && view !== 'canvas' && (
+        <button
+          className="nav-btn rightbar-toggle"
+          onClick={() => toggleRightbar()}
+          title={`${rightbarOpen ? 'Hide' : 'Show'} right panel (⌘⇧\\)`}
+        >
+          ☰
+        </button>
+      )}
+      {pageMenu && activePath && (
+        <ContextMenu
+          x={pageMenu.x}
+          y={pageMenu.y}
+          // Parity with the sidebar's right-click menu — with the sidebar hidden
+          // (⌘\), this is the only way to reach these actions.
+          items={[
+            { label: isPinned ? 'Unpin' : 'Pin to top', onClick: () => void togglePin(activePath) },
+            ...(templates.length
+              ? [{ label: '▤ Apply template…', onClick: () => setTplMenu({ x: pageMenu.x, y: pageMenu.y }) }]
+              : []),
+            { label: 'Duplicate', onClick: () => void duplicateNote(activePath) },
+            // Zen has no visible affordance anywhere else — ⌘⌥\ is undiscoverable
+            // on its own, so the one menu that's always reachable carries it.
+            { label: '◻ Zen mode (⌘⌥\\)', onClick: () => toggleZen() },
+            { label: '⧉ Compile from links…', onClick: () => openModal('compile') },
+            { label: '↺ History…', onClick: () => setHistoryFor(activePath) },
+            { label: '⤓ Export as PDF…', onClick: () => void exportActivePdf(activePath, nameOf(activePath)) },
+            { label: REVEAL_LABEL, onClick: () => void revealNote(activePath) },
+            {
+              label: 'Delete',
+              danger: true,
+              onClick: () => {
+                if (window.confirm(`Move “${nameOf(activePath)}” to the Trash?`)) void deleteNote(activePath)
+              }
+            }
+          ]}
+          onClose={() => setPageMenu(null)}
+        />
+      )}
+      {tplMenu && activePath && (
+        <ContextMenu
+          x={tplMenu.x}
+          y={tplMenu.y}
+          items={templates.map((t) => ({
+            label: t.name,
+            onClick: () => void applyTemplateToNote(activePath, t.path)
+          }))}
+          onClose={() => setTplMenu(null)}
+        />
+      )}
+      {historyFor && <HistoryPanel path={historyFor} onClose={() => setHistoryFor(null)} />}
+    </div>
+  )
+}
+
+/** Flush pending edits, then print the window to a PDF (print CSS isolates the note). */
+async function exportActivePdf(_path: string, name: string): Promise<void> {
+  await useStore.getState().saveActive()
+  const saved = await window.grantha.exportPdf(name)
+  if (saved === null) return // cancelled, or failed (already logged in main)
+}
+
+// Remembers each note's scroll offset for the session, so switching away and back returns
+// you to where you were rather than the top. In-memory only (deliberately not persisted).
+const scrollMemory = new Map<string, number>()
+
+function NoteArea({ path }: { path: string }): React.JSX.Element {
+  const ref = useRef<HTMLDivElement>(null)
+  // Keyed by vault root + note path — relative paths recur across vaults, and an
+  // offset saved in one vault must not apply to a same-named note in another.
+  const root = useStore((s) => s.workspace?.root ?? '')
+  const memKey = `${root}\n${path}`
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    // BlockEditor (keyed by path) has just remounted with this note's content, so the
+    // scroll height is in place — restore the saved offset.
+    el.scrollTop = scrollMemory.get(memKey) ?? 0
+    // The listener keeps this note's offset current while it's open; we must NOT save again
+    // in cleanup, because by then the keyed BlockEditor has swapped in the next note's
+    // content and el.scrollTop no longer belongs to `path`.
+    const save = (): void => void scrollMemory.set(memKey, el.scrollTop)
+    el.addEventListener('scroll', save, { passive: true })
+    return () => el.removeEventListener('scroll', save)
+  }, [memKey])
+  return (
+    <div className="scroll-area" ref={ref}>
+      <div className="doc">
+        <NoteTitle path={path} />
+        <ErrorBoundary label="Note editor">
+          <BlockEditor key={path} path={path} />
+        </ErrorBoundary>
+      </div>
+      <Backlinks path={path} />
+    </div>
+  )
+}
+
+function SideNote({ path, paneIndex }: { path: string; paneIndex: number }): React.JSX.Element {
+  const closeSidePane = useStore((s) => s.closeSidePane)
+  const promoteSidePane = useStore((s) => s.promoteSidePane)
+  const name = useStore((s) => s.files.find((f) => f.path === path)?.name ?? path.split('/').pop())
+  return (
+    <div className="side-note">
+      {/* Double-click the bar to promote too — the button is small, and the header
+          is the thing you're already pointing at when you decide to expand. */}
+      <div className="pdf-pane-head" onDoubleClick={() => promoteSidePane(paneIndex)}>
+        <span className="pdf-pane-title">{name}</span>
+        <div className="pane-head-actions">
+          <button
+            className="icon-btn"
+            title="Open in main pane"
+            aria-label="Open in main pane"
+            onClick={() => promoteSidePane(paneIndex)}
+          >
+            ⤢
+          </button>
+          <button className="icon-btn" title="Close pane" onClick={() => closeSidePane(paneIndex)}>
+            ✕
+          </button>
+        </div>
+      </div>
+      <NoteArea path={path} />
+    </div>
+  )
+}
+
+/** One right-hand split: a draggable divider plus its note/PDF content. */
+function SplitPane({ pane, paneIndex }: { pane: SidePane; paneIndex: number }): React.JSX.Element {
+  const [width, setWidth] = useState(480)
+
+  const startResize = (e: React.MouseEvent): void => {
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = width
+    const onMove = (ev: MouseEvent): void =>
+      setWidth(Math.min(Math.max(280, startW + (startX - ev.clientX)), window.innerWidth - 360))
+    const onUp = (): void => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.userSelect = ''
+    }
+    document.body.style.userSelect = 'none'
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }
+
+  return (
+    <>
+      <div className="pane-resize" onMouseDown={startResize} title="Drag to resize" />
+      <ErrorBoundary label="Split pane">
+        <Suspense fallback={<div className="view-loading">Loading…</div>}>
+          <div className="split-pane" style={{ width }}>
+            {pane.kind === 'pdf' ? (
+              <PdfWorkspace key={pane.path} path={pane.path} width={width} paneIndex={paneIndex} />
+            ) : (
+              <SideNote key={pane.path} path={pane.path} paneIndex={paneIndex} />
+            )}
+          </div>
+        </Suspense>
+      </ErrorBoundary>
+    </>
+  )
+}
+
+function RightSidebar(): React.JSX.Element {
+  const view = useStore((s) => s.view)
+  const activePath = useStore((s) => s.activePath)
+  const ensureDailyNote = useStore((s) => s.ensureDailyNote)
+  const openNote = useStore((s) => s.openNote)
+
+  const rightbarWidth = useStore((s) => s.rightbarWidth)
+  const setRightbarWidth = useStore((s) => s.setRightbarWidth)
+
+  return (
+    <aside className="rightbar">
+      <ResizeHandle side="right" width={rightbarWidth} onResize={setRightbarWidth} label="Resize right panel" />
+      <RightSection id="calendar" title="Calendar">
+        <Calendar onPick={(iso) => void ensureDailyNote(iso).then(openNote)} />
+      </RightSection>
+      {view === 'journal' && <OnThisDay />}
+      {view === 'editor' && activePath && (
+        <>
+          <RightSection id="properties" title="Properties">
+            <PropertiesPanel key={activePath} path={activePath} />
+          </RightSection>
+          <TableOfContents key={'toc:' + activePath} path={activePath} />
+          <SimilarNotes key={'sim:' + activePath} path={activePath} />
+          <LocalGraph key={'lg:' + activePath} path={activePath} />
+        </>
+      )}
+    </aside>
+  )
+}
+
+function MainArea(): React.JSX.Element {
+  const view = useStore((s) => s.view)
+  const activePath = useStore((s) => s.activePath)
+  const sidePanes = useStore((s) => s.sidePanes)
+  const rightbarOpen = useStore((s) => s.rightbarOpen)
+
+  let content: React.ReactNode
+  if (view === 'graph') content = <GraphView />
+  else if (view === 'canvas') content = <CanvasView />
+  else if (view === 'database') content = <BasesView />
+  else if (view === 'assets') content = <AssetsView />
+  else if (view === 'tags') content = <TagsView />
+  else if (view === 'journal') content = <JournalView />
+  else if (view === 'todos') content = <TodosView />
+  else if (view === 'tend') content = <TendView />
+  else if (activePath) content = <NoteArea path={activePath} />
+  else
+    content = (
+      <div className="scroll-area">
+        <div className="doc empty-doc">
+          <img className="empty-logo" src="./logo-wordmark.png" alt="Grantha" />
+          <p className="empty-note">Select or create a note from the sidebar.</p>
+        </div>
+      </div>
+    )
+
+  return (
+    <div className="main">
+      <TopBar />
+      <div className="main-body">
+        <ErrorBoundary>
+          <Suspense fallback={<div className="view-loading">Loading…</div>}>{content}</Suspense>
+        </ErrorBoundary>
+        {sidePanes.map((p, i) => (
+          <SplitPane key={`${p.kind}:${p.path}`} pane={p} paneIndex={i} />
+        ))}
+        {sidePanes.length || view === 'graph' || view === 'canvas' || !rightbarOpen ? null : ( // graph/canvas full width; or panel hidden
+          <ErrorBoundary label="Sidebar">
+            <Suspense fallback={null}>
+              <RightSidebar />
+            </Suspense>
+          </ErrorBoundary>
+        )}
+      </div>
+    </div>
+  )
+}
+
+export function App(): React.JSX.Element {
+  const workspace = useStore((s) => s.workspace)
+  const bootstrap = useStore((s) => s.bootstrap)
+  const applyFileEvent = useStore((s) => s.applyFileEvent)
+  const sidebarOpen = useStore((s) => s.sidebarOpen)
+  const theme = useStore((s) => s.theme)
+  const accent = useStore((s) => s.accent)
+  const customCss = useStore((s) => s.customCss)
+  const editorFont = useStore((s) => s.editorFont)
+  const editorFontSize = useStore((s) => s.editorFontSize)
+  const sidebarWidth = useStore((s) => s.sidebarWidth)
+  const rightbarWidth = useStore((s) => s.rightbarWidth)
+  const zen = useStore((s) => s.zen)
+
+  // Panel widths ride on CSS variables (same pattern as the accent and the editor
+  // font) so a drag repaints one custom property instead of re-rendering the tree.
+  useEffect(() => {
+    const root = document.documentElement
+    root.style.setProperty('--sidebar-w', `${sidebarWidth}px`)
+    root.style.setProperty('--rightbar-w', `${rightbarWidth}px`)
+  }, [sidebarWidth, rightbarWidth])
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme
+  }, [theme])
+
+  // Accent theme: override the palette's accent variables on the root element,
+  // using the variant tuned for the active theme (dark hues wash out on white).
+  // Both `light` and `paper` are light themes — only `dark` takes the dark hues.
+  useEffect(() => {
+    const a = ACCENTS.find((x) => x.key === accent) ?? ACCENTS[0]
+    const vars = theme === 'dark' ? a.dark : a.light
+    const root = document.documentElement
+    root.style.setProperty('--accent', vars.accent)
+    root.style.setProperty('--accent-dim', vars.accentDim)
+    root.style.setProperty('--link', vars.link)
+  }, [accent, theme])
+
+  // Vault custom stylesheet (`.verso/custom.css`) — injected as a <style> tag and
+  // hot-reloaded when the file changes on disk (via the watcher).
+  useEffect(() => {
+    let el = document.getElementById('vault-custom-css') as HTMLStyleElement | null
+    if (!customCss) {
+      el?.remove()
+      return
+    }
+    if (!el) {
+      el = document.createElement('style')
+      el.id = 'vault-custom-css'
+      document.head.appendChild(el)
+    }
+    el.textContent = customCss
+  }, [customCss])
+
+  useEffect(() => {
+    const font = EDITOR_FONTS.find((f) => f.key === editorFont) ?? EDITOR_FONTS[0]
+    const root = document.documentElement
+    root.style.setProperty('--font-editor', font.stack)
+    root.style.setProperty('--doc-font-size', `${editorFontSize}px`)
+  }, [editorFont, editorFontSize])
+
+  useEffect(() => {
+    void bootstrap()
+    const off = window.grantha.onFileEvent((event) => void applyFileEvent(event))
+    return off
+  }, [bootstrap, applyFileEvent])
+
+  // Flush any debounced writes when the window is hidden or closing, so edits and
+  // checkbox toggles aren't lost if the app is quit before the save timer fires.
+  useEffect(() => {
+    const flush = (): void => void useStore.getState().saveActive()
+    const onVis = (): void => {
+      if (document.visibilityState === 'hidden') flush()
+    }
+    window.addEventListener('beforeunload', flush)
+    document.addEventListener('visibilitychange', onVis)
+    // The real close path: main intercepts the window close, we flush ALL pending
+    // writes (awaiting the per-path write chains), then ack so main can close.
+    const offFlush = window.grantha.onFlushRequest(() => {
+      void useStore
+        .getState()
+        .saveActive()
+        .finally(() => window.grantha.flushDone())
+    })
+    return () => {
+      window.removeEventListener('beforeunload', flush)
+      document.removeEventListener('visibilitychange', onVis)
+      offFlush()
+    }
+  }, [])
+
+  // Navigation shortcuts: command palette, back/forward, and close the last split.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (!(e.metaKey || e.ctrlKey)) return
+      const s = useStore.getState()
+      // While typing in a field, don't hijack keys that edit or navigate — a stray
+      // ⌘[ in a rename input must not throw away the user's typing context.
+      const typing = !!(e.target as HTMLElement | null)?.closest?.(
+        'input, textarea, [contenteditable="true"]'
+      )
+      if (e.key === 'k' || e.key === 'K' || (e.key === 'p' && !e.shiftKey)) {
+        e.preventDefault()
+        s.setPalette(!s.paletteOpen)
+      } else if (e.key === '[' && !typing) {
+        e.preventDefault()
+        s.goBack()
+      } else if (e.key === ']' && !typing) {
+        e.preventDefault()
+        s.goForward()
+      } else if (
+        (e.key === 'd' || e.key === 'D') &&
+        // The canvas binds ⌘D to duplicate on window too — both handlers would
+        // fire and you'd copy a card AND navigate away from it.
+        s.view !== 'canvas'
+      ) {
+        // Today's daily note itself, not the Journal feed: ⌘D is "take me to today's
+        // page". ensureDailyNote seeds it from Templates/Journal on first open.
+        // Deliberately NOT gated on `typing` — jumping to today mid-sentence is the point.
+        e.preventDefault()
+        void s.ensureDailyNote(todayISO()).then((p) => useStore.getState().openNote(p))
+      } else if (e.key === 'w' && !typing && s.sidePanes.length) {
+        e.preventDefault()
+        s.closeSidePane()
+      } else if (e.code === 'Backslash' && e.altKey) {
+        // Third of the panel family: ⌘\ sidebar, ⌘⇧\ right panel, ⌘⌥\ everything.
+        e.preventDefault()
+        s.toggleZen()
+      } else if (e.code === 'Backslash' && e.shiftKey) {
+        e.preventDefault()
+        s.toggleRightbar()
+      } else if (e.key === '\\') {
+        e.preventDefault()
+        s.toggleSidebar()
+      } else if ((e.key === 't' || e.key === 'T') && e.shiftKey) {
+        // Quick capture: deliberately NOT gated on `typing` — dropping a task into
+        // today mid-sentence, from anywhere, is the whole point.
+        e.preventDefault()
+        s.openModal('task')
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
+  if (!workspace) return <Welcome />
+
+  return (
+    <div className={'app' + (sidebarOpen ? '' : ' sidebar-closed') + (zen ? ' zen' : '')}>
+      {/* Hidden, not unmounted — ⌘\ must not reset folder expansion, the search
+          query, or the scroll position every time the sidebar is re-shown. */}
+      <div style={{ display: sidebarOpen && !zen ? 'contents' : 'none' }}>
+        <Sidebar />
+      </div>
+      <MainArea />
+      {zen && <ZenExit />}
+      <LinkPreview />
+      <CommandPalette />
+      <Modals />
+      <SaveErrorToast />
+    </div>
+  )
+}
+
+/** The way out of Zen. Faded until the pointer nears it, because a permanent
+ *  button in the corner is exactly the chrome Zen was asked to remove — but a mode
+ *  with no visible exit is a trap, and Escape alone isn't discoverable. */
+function ZenExit(): React.JSX.Element {
+  const toggleZen = useStore((s) => s.toggleZen)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      // Only when nothing else owns Escape — a find bar or popup gets it first.
+      if (e.key !== 'Escape' || e.defaultPrevented) return
+      if ((e.target as HTMLElement | null)?.closest?.('input, textarea')) return
+      toggleZen()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [toggleZen])
+  return (
+    <button className="zen-exit" onClick={() => toggleZen()} title="Leave Zen mode (esc · ⌘⌥\)">
+      ✕ Zen
+    </button>
+  )
+}
+
+/** A dismissible toast for failed disk writes — a save must never fail silently. */
+function SaveErrorToast(): React.JSX.Element | null {
+  const saveError = useStore((s) => s.saveError)
+  const dismiss = useStore((s) => s.dismissSaveError)
+  if (!saveError) return null
+  return (
+    <div className="save-toast" role="alert">
+      <span>⚠︎ {saveError}</span>
+      <button className="icon-btn" title="Dismiss" onClick={() => dismiss()}>
+        ✕
+      </button>
+    </div>
+  )
+}
+
+function Modals(): React.JSX.Element | null {
+  const modal = useStore((s) => s.modal)
+  const closeModal = useStore((s) => s.closeModal)
+  const activePath = useStore((s) => s.activePath)
+  // QuickTask stays eager — it is ⌘⇧T capture, and a chunk fetch between the
+  // keystroke and the input appearing is exactly the pause capture can't have.
+  if (modal === 'task') return <QuickTask onClose={closeModal} />
+  const lazyModal =
+    modal === 'settings' ? (
+      <Settings onClose={closeModal} />
+    ) : modal === 'help' ? (
+      <Help onClose={closeModal} />
+    ) : modal === 'compile' && activePath ? (
+      <CompileView path={activePath} onClose={closeModal} />
+    ) : null
+  if (!lazyModal) return null
+  return (
+    <ErrorBoundary>
+      <Suspense fallback={null}>{lazyModal}</Suspense>
+    </ErrorBoundary>
+  )
+}

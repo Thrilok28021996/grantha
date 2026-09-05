@@ -1,0 +1,1683 @@
+import { create } from 'zustand'
+import type { CanvasMeta, FileEvent, NoteFile, ParsedNote, Workspace } from '@shared/types'
+import { parseNote } from '../lib/parse'
+import { VaultIndex } from '../lib/vault'
+import { basename, dirname, pathForNewNote, resolveTarget, rewriteLinks } from '../lib/links'
+import { resetSpell, setVaultWords } from '../lib/spell'
+import { getFrontmatter, parseFrontmatter, replaceFrontmatter } from '../lib/frontmatter'
+import { applyTemplate } from '../lib/templates'
+import { dailyPath, isValidISO, todayISO } from '../lib/dates'
+import { pdfBus } from '../lib/pdfbus'
+import { normalizeBases, legacyLocalBases, clearLegacyLocalBases, type Base } from '../lib/bases'
+import { dropFromScanCache, clearScanCache } from '../lib/query'
+import { clearTodoCache } from '../lib/todos'
+import { clearSearchCache, dropFromSearchCache } from '../lib/search'
+import { clearSimilarCache } from '../lib/similar'
+import { normalizeDoc } from '../lib/canvas'
+import { escapeRegExp } from '../lib/md'
+import {
+  buildSupertagIndex,
+  fieldsToFrontmatter,
+  normTag,
+  supertagsFromParsed,
+  TAGS_DIR,
+  type FieldDef
+} from '../lib/supertags'
+import type { ViewMode, HistEntry, ThemeName, ModalKind, IndentGuides, SidePane } from './types'
+
+// Two one-time migrations: releases before 0.2 used "inkwell", then "verso".
+// Must run before the store's initial state reads any of them.
+if (typeof localStorage !== 'undefined') {
+  for (const k of Object.keys(localStorage)) {
+    // Migrate inkwell-* or verso-* keys to grantha-*
+    const prefix = k.startsWith('inkwell-') ? 'inkwell-' : k.startsWith('verso-') ? 'verso-' : null
+    if (!prefix) continue
+    const renamed = 'grantha-' + k.slice(prefix.length)
+    if (localStorage.getItem(renamed) === null) {
+      localStorage.setItem(renamed, localStorage.getItem(k)!)
+    }
+    localStorage.removeItem(k)
+  }
+}
+
+interface GranthaState {
+  workspace: Workspace | null
+  /** All vaults the user has opened, most-recent first — for the sidebar switcher. */
+  recentVaults: string[]
+  files: NoteFile[]
+  texts: Record<string, string>
+  /** Bumped on every text change. `texts` is mutated IN PLACE on the typing hot
+   *  path (same map identity, so per-keystroke cloning never happens) — subscribe
+   *  to this tick, not the map, to react to text changes. */
+  textsTick: number
+  /** True while the vault is still hydrating in the background. The app is fully
+   *  usable during this: the file tree, navigation and the open note are all live —
+   *  only vault-WIDE derivations (backlinks, search, graph, queries) are incomplete. */
+  vaultLoading: boolean
+  /** Notes hydrated so far / total, for the sidebar progress line. */
+  loadedCount: number
+  totalCount: number
+  parsed: Record<string, ParsedNote>
+  /** What changed in `parsed` on the last update: the paths whose entries were
+   *  re-derived (adds, edits and deletes alike), or null when the whole map was
+   *  replaced (vault load/reload/rename). Consumers that only care about edits to
+   *  OTHER notes can check this list instead of diffing the map — the editor's
+   *  row-memo signal used to walk every parsed note twice per debounced rebuild. */
+  parsedChanges: { rev: number; paths: readonly string[] | null }
+  index: VaultIndex
+  /** Global navigation history for back/forward (main pane) — notes and view screens. */
+  history: HistEntry[]
+  histIndex: number
+  /** Right-hand splits: cmd-clicked notes / open PDFs, in open order (N-way split). */
+  sidePanes: SidePane[]
+  /** The note/view shown in the main (left) pane. */
+  activePath: string | null
+  view: ViewMode
+  /** A pending request to open the in-note find on `path` for `query` (from sidebar search). */
+  findRequest: { path: string; query: string } | null
+  theme: ThemeName
+  /** Accent theme key (see ACCENTS). */
+  accent: string
+  /** Contents of the vault's `.verso/custom.css`, injected into the page (or null). */
+  customCss: string | null
+  /** Editor font family key (see EDITOR_FONTS) and base font size in px. */
+  editorFont: string
+  editorFontSize: number
+  /** Vertical guides down the outliner's indent levels: off, one faint line per
+   *  level, or a colour per depth ("rainbow" — the depth is easier to count when
+   *  the levels differ rather than repeat). */
+  indentGuides: IndentGuides
+  /** Spellcheck on/off. Off means no checking, no underlines, no IPC at all. */
+  spellcheck: boolean
+  /** Fetch a pasted URL's page title ("smart titles"). The one feature that makes a
+   *  network request on its own — off means the app only loads what notes embed. */
+  smartLinkTitles: boolean
+  /** Open on the Journal (today) rather than the last note. The app's front door. */
+  homeJournal: boolean
+  dirty: boolean
+  loading: boolean
+  /** The last failed disk write ("path: reason"), surfaced as a toast; null when clear. */
+  saveError: string | null
+  /** Saved base views (Obsidian-style tables/galleries). */
+  bases: Base[]
+  /** Which base the Bases view should show. */
+  activeBaseId: string | null
+  /** Spatial canvases (`.canvas` files) in the vault, newest first — for the sidebar. */
+  canvases: CanvasMeta[]
+  /** Which canvas the Canvas view should show (workspace-relative path). */
+  activeCanvasPath: string | null
+  /** Tag the Tags view is focused on, or null for the tag index. */
+  activeTag: string | null
+  /** Which full-screen modal is open (settings/help), or null. */
+  modal: ModalKind
+  /** Whether the command palette / quick-switcher is open. */
+  paletteOpen: boolean
+  /** Whether the left sidebar (file tree) is shown. */
+  sidebarOpen: boolean
+  /** Whether the right sidebar (calendar/properties/TOC/graph) is shown. */
+  rightbarOpen: boolean
+  /** Left sidebar width in px (drag its edge; persisted). */
+  sidebarWidth: number
+  /** Right panel width in px (drag its edge; persisted). */
+  rightbarWidth: number
+  /** Zen mode: chrome hidden, just the document. Session-only, never persisted. */
+  zen: boolean
+
+  toggleTheme: () => void
+  setTheme: (t: ThemeName) => void
+  setAccent: (key: string) => void
+  /** Re-read `.verso/custom.css` from the vault (called on load and on file change). */
+  reloadCustomCss: () => Promise<void>
+  dismissSaveError: () => void
+  toggleSidebar: () => void
+  toggleRightbar: () => void
+  setSidebarWidth: (px: number) => void
+  setRightbarWidth: (px: number) => void
+  toggleZen: () => void
+  /** Append `- [ ] text` to today's daily note, creating it if today is new. */
+  addTaskToToday: (text: string) => Promise<void>
+  setEditorFont: (key: string) => void
+  setEditorFontSize: (px: number) => void
+  setIndentGuides: (mode: IndentGuides) => void
+  setSpellcheck: (on: boolean) => void
+  setSmartLinkTitles: (on: boolean) => void
+  setHomeJournal: (on: boolean) => void
+  openModal: (modal: Exclude<ModalKind, null>) => void
+  closeModal: () => void
+  setPalette: (open: boolean) => void
+  /** Open the Tags view, optionally focused on one tag. */
+  openTag: (tag: string | null) => void
+  /** Create a note from a template file and open it. */
+  newFromTemplate: (templatePath: string, folder?: string) => Promise<void>
+  /** Tag a note with a supertag (adds it to frontmatter `tags`, making the note an instance). */
+  applySupertag: (notePath: string, tag: string) => Promise<void>
+  /** Resolve (or create) a note named `name` and apply `tag` to it. Returns its path. */
+  ensureEntity: (name: string, tag: string) => Promise<string>
+  /** Create a new supertag definition note under `Tags/` and open it
+   *  (pass `{ open: false }` to create in the background, e.g. from the `#` picker). */
+  /** Create (or find) a tag's definition note; returns its path so the caller can
+   *  immediately write a schema to it — that's how a plain tag gains its first field. */
+  createSupertag: (name: string, opts?: { open?: boolean }) => Promise<string | null>
+  /** Write a supertag's field schema to its definition note. */
+  setSupertagFields: (defPath: string, fields: FieldDef[]) => Promise<void>
+  /** Delete a tag's definition note, i.e. its schema. The tag itself survives on
+   *  every note carrying it — this demotes a typed tag back to a plain one (and,
+   *  for a tag nothing uses, removes it entirely). */
+  removeSupertag: (tag: string) => Promise<void>
+  /** Apply `tag` to every note under `folder` (recursively). */
+  applySupertagToFolder: (folder: string, tag: string) => Promise<void>
+  /** Create a supertag named after `folder`, inferring its fields from the folder's notes,
+   *  then tag every note in the folder with it. Opens the new supertag's page. */
+  createSupertagFromFolder: (folder: string) => Promise<void>
+  /** Apply a template to an EXISTING note: merge its properties + append its body (note's own values win). */
+  applyTemplateToNote: (notePath: string, templatePath: string) => Promise<void>
+  /** Drag-reorder: move `dragPath` to sit just before `dropPath` among shared siblings. */
+  reorderTo: (dragPath: string, dropPath: string) => Promise<void>
+  /** Move a note into `folder` (drag-drop onto a folder). */
+  moveToFolder: (path: string, folder: string) => Promise<void>
+  /** Persist the full set of bases. */
+  setBases: (bases: Base[]) => void
+  /** Open the Bases view focused on a specific base. */
+  openBase: (id: string) => void
+  /** Re-scan the vault for `.canvas` files (after create/delete/rename). */
+  refreshCanvases: () => Promise<void>
+  /** Open the Canvas view, defaulting to the most recent canvas. */
+  openCanvasView: () => void
+  /** Open the Canvas view focused on a specific canvas file. */
+  openCanvas: (path: string) => void
+  /** Create a new canvas (under `folder`) and open it. */
+  createCanvas: (name: string, folder?: string) => Promise<void>
+  /** Send a canvas to the OS trash and drop it from the list. */
+  deleteCanvas: (path: string) => Promise<void>
+  /** Rename a canvas file; keeps it open if it was active. */
+  renameCanvas: (path: string, name: string) => Promise<void>
+  bootstrap: () => Promise<void>
+  openWorkspace: () => Promise<void>
+  /** Open the bundled demo vault (copied somewhere writable on first use). */
+  openDemoVault: () => Promise<void>
+  /** Switch to an already-known vault by path (flushes pending edits first). */
+  switchVault: (root: string) => Promise<void>
+  /** Forget a vault from the switcher list (does not delete its files). */
+  forgetVault: (root: string) => Promise<void>
+  /** Re-scan the workspace folder from disk (recovers files the watcher missed). */
+  reloadVault: () => Promise<void>
+
+  // ---- navigation (panes, no tabs) ----
+  openNote: (path: string) => void
+  /** Open a note and ask its editor to find `query` in it (sidebar search → jump to match). */
+  openNoteWithFind: (path: string, query: string) => void
+  /** Clear a consumed find request. */
+  clearFindRequest: () => void
+  /** Open a note in a new right-hand split (cmd/ctrl-click). */
+  openInSidePane: (path: string) => void
+  /** Open in a side pane, REUSING the last note pane — for clicking through a
+   *  list of results without stacking a split per click. */
+  previewInSidePane: (path: string) => void
+  openView: (view: ViewMode) => void
+  /** Open a PDF in a right-hand split; optionally scroll to a highlight. */
+  openPdf: (path: string, highlightId?: string) => void
+  /** Close the split at `index` (or the last one when omitted). */
+  closeSidePane: (index?: number) => void
+  /** Move the note in the split at `index` into the main pane, closing the split. */
+  promoteSidePane: (index: number) => void
+  goBack: () => void
+  goForward: () => void
+
+  // ---- editing ----
+  /** Replace a note's body (frontmatter preserved). Used by block editors (incl. journal). */
+  setNoteBody: (path: string, body: string) => void
+  /** Replace a note's full text (frontmatter included). Used by the source editor. */
+  editNote: (path: string, text: string) => void
+  /** Replace the active note's full text. */
+  editActive: (text: string) => void
+  /** Flush all pending debounced saves to disk. */
+  saveActive: () => Promise<void>
+  /** True if `path` has an unsaved buffered edit (module state, so a getter). */
+  hasPendingEdit: (path: string) => boolean
+  setNoteProperties: (path: string, data: Record<string, unknown>) => Promise<void>
+  /** Persist resized column widths for the `index`-th table block (app-managed `_tableWidths`). */
+  setTableWidths: (path: string, index: number, widths: number[]) => Promise<void>
+  /** Toggle a note's `pinned: true` frontmatter flag. */
+  togglePin: (path: string) => Promise<void>
+  /** Wrap a plain-text mention of `name` on `sourcePath` line `line` in [[ ]]. */
+  linkUnlinked: (sourcePath: string, line: number, name: string) => Promise<void>
+  /** Convert every unlinked mention of the note at `path` into a [[link]]. */
+  linkAllUnlinked: (path: string) => Promise<void>
+
+  /** Toggle the checkbox on a task line (0-based, full-text line index) of any note. */
+  toggleTask: (path: string, line: number) => void
+
+  // ---- navigation helpers ----
+  navigate: (raw: string, side?: boolean) => Promise<void>
+  ensureDailyNote: (iso: string) => Promise<string>
+
+  // ---- file management ----
+  applyFileEvent: (event: FileEvent) => Promise<void>
+  renameNote: (oldPath: string, input: string) => Promise<void>
+  /** Move a note up/down among its folder siblings (persists via `_order`). */
+  reorderNote: (path: string, dir: -1 | 1) => Promise<void>
+  deleteNote: (path: string) => Promise<void>
+  duplicateNote: (path: string) => Promise<void>
+  revealNote: (path: string) => Promise<void>
+}
+
+function buildIndex(parsed: Record<string, ParsedNote>, texts: Record<string, string>): VaultIndex {
+  return new VaultIndex(Object.values(parsed), texts)
+}
+
+/** Wrap the first plain-text (not already-linked) occurrence of `name` in `line` with [[ ]]. */
+function wrapMention(line: string, name: string): string {
+  const re = new RegExp(`(^|[^\\w[/])(${escapeRegExp(name)})(?![\\w\\]/])`, 'i')
+  return line.replace(re, (_m, pre: string, nm: string) => `${pre}[[${nm}]]`)
+}
+
+/** Notes read per round trip while hydrating. Large enough that the IPC overhead is
+ *  amortized, small enough that the renderer paints between batches. */
+const HYDRATE_CHUNK = 400
+
+/** Drag limits for the two side panels. Clamped on read as well as on write, so a
+ *  stale localStorage value (or a window that shrank since) can never leave a panel
+ *  wider than the window with no way to grab its handle back. */
+const PANEL_LIMITS = { sidebar: { min: 180, max: 520 }, rightbar: { min: 200, max: 560 } }
+
+function clampPanel(px: number, which: 'sidebar' | 'rightbar'): number {
+  const { min, max } = PANEL_LIMITS[which]
+  const room = typeof window !== 'undefined' ? Math.max(min, window.innerWidth - 420) : max
+  return Math.round(Math.min(Math.max(px, min), Math.min(max, room)))
+}
+
+/**
+ * Load this workspace's saved Bases from `.verso/bases.json`. One-time migration:
+ * any bases still in the old localStorage are merged in (then localStorage is cleared),
+ * so bases made in the dev app and the installed app both survive into the vault file.
+ */
+async function loadWorkspaceBases(): Promise<Base[]> {
+  const vault = normalizeBases(await window.grantha.readBases())
+  const legacy = legacyLocalBases()
+  if (legacy.length === 0) return vault
+  const ids = new Set(vault.map((b) => b.id))
+  const merged = [...vault, ...legacy.filter((b) => !ids.has(b.id))]
+  clearLegacyLocalBases()
+  await window.grantha.writeBases(merged)
+  return merged
+}
+
+export const useStore = create<GranthaState>((set, get) => {
+  // Rebuilding the whole vault index (backlinks + block scan over every note) is
+  // too heavy to run on every keystroke, so we debounce it. texts/parsed update
+  // immediately; index consumers (backlinks, queries, graph) are eventually consistent.
+  let indexTimer: ReturnType<typeof setTimeout> | null = null
+  // Monotonic revision behind `parsedChanges`; `null` paths means "assume all".
+  let parsedRev = 0
+  const changed = (paths: readonly string[] | null): { rev: number; paths: readonly string[] | null } => ({
+    rev: ++parsedRev,
+    paths
+  })
+  // Paths whose text changed during typing but whose `parsed` entry hasn't been
+  // re-derived yet — the parse is deferred to the debounce so each keystroke is O(1).
+  const dirtyPaths = new Set<string>()
+  const scheduleIndexRebuild = (): void => {
+    if (indexTimer) clearTimeout(indexTimer)
+    indexTimer = setTimeout(() => {
+      indexTimer = null
+      const texts = get().texts
+      let parsed = get().parsed
+      const reparsed: ParsedNote[] = []
+      const touched = [...dirtyPaths]
+      let removed = false
+      if (dirtyPaths.size) {
+        parsed = { ...parsed }
+        for (const p of dirtyPaths) {
+          if (texts[p] === undefined) {
+            delete parsed[p]
+            removed = true
+          } else {
+            const pn = parseNote(p, texts[p])
+            parsed[p] = pn
+            reparsed.push(pn)
+          }
+        }
+        dirtyPaths.clear()
+      }
+      // Hot path: a pure content edit (no adds/deletes) patches the existing index
+      // in O(edited notes); anything else (new/removed note, alias change) falls
+      // back to a full rebuild. `withContentChanges` returns null when it can't patch.
+      const incremental =
+        !removed && reparsed.length ? get().index.withContentChanges(reparsed, texts) : null
+      set({
+        parsed,
+        parsedChanges: changed(touched),
+        index: incremental ?? buildIndex(parsed, texts)
+      })
+      publishVaultWords(parsed)
+    }, 200)
+  }
+  // Typing hot path: mutate just the changed note's text in place (cloning a 50k-key
+  // map every keystroke is what caused input lag at scale) and defer parsing + the
+  // index rebuild to the debounce. `parsed`/`index` consumers are eventually consistent.
+  const updateText = (path: string, text: string): void => {
+    const texts = get().texts
+    texts[path] = text
+    set({ texts, textsTick: get().textsTick + 1 })
+    dirtyPaths.add(path)
+    scheduleIndexRebuild()
+  }
+  // Immediate update for one-off writes (properties, task toggles) that aren't
+  // per-keystroke — re-derive this note's `parsed` entry right away. The debounced
+  // rebuild patches incrementally; `withContentChanges` itself falls back to a full
+  // rebuild when the edit could shift resolution vault-wide (alias changes).
+  const updateNoteState = (path: string, text: string): void => {
+    set({
+      texts: { ...get().texts, [path]: text },
+      parsed: { ...get().parsed, [path]: parseNote(path, text) },
+      parsedChanges: changed([path])
+    })
+    dirtyPaths.add(path)
+    scheduleIndexRebuild()
+  }
+
+  /** Hand the spellchecker the vault's own proper nouns — note names, aliases and
+   *  tags — so it stops underlining the user's vocabulary (see lib/spell). */
+  const publishVaultWords = (parsed: Record<string, ParsedNote>): void => {
+    const words: string[] = []
+    for (const n of Object.values(parsed)) {
+      words.push(n.name)
+      if (n.aliases) words.push(...n.aliases)
+      words.push(...n.tags)
+    }
+    setVaultWords(words)
+  }
+
+  // Per-path write chains: every disk write for a path is appended to that path's
+  // chain, so a debounced flush and an immediate write (properties, task toggle)
+  // issued mid-flush can never land out of order and clobber each other.
+  const writeChains = new Map<string, Promise<void>>()
+  const queueWrite = (p: string, t: string): Promise<void> => {
+    const chained = (writeChains.get(p) ?? Promise.resolve()).then(async () => {
+      const res = await window.grantha.writeNote(p, t)
+      if (res.ok && res.conflictPath) {
+        // The file changed on disk (sync tool / another app) while this edit was
+        // buffered. Our version kept the note's path; theirs was preserved as a
+        // sibling conflict file — tell the user so nothing is lost silently.
+        set({
+          saveError: `Sync conflict on ${basename(p)}: another version was saved as “${basename(res.conflictPath)}”`
+        })
+      }
+      if (!res.ok) {
+        set({ saveError: `Couldn't save ${p}: ${res.error}` })
+        // Don't drop the edit: put the text back in the buffer (unless a newer edit
+        // is already queued for this path) so a later flush retries the write
+        // instead of silently losing the change on quit.
+        if (!pending.has(p)) {
+          pending.set(p, t)
+          syncDirty()
+          scheduleFlush(5000) // back off — retrying every 600ms would spam a dead disk
+        }
+      }
+    })
+    writeChains.set(p, chained)
+    void chained.finally(() => {
+      if (writeChains.get(p) === chained) writeChains.delete(p)
+    })
+    return chained
+  }
+
+  // Debounced per-path saves, so multiple editors (e.g. journal days) can be live at once.
+  const pending = new Map<string, string>()
+  /** `dirty` is always derived from `pending` — call after any pending mutation. */
+  const syncDirty = (): void => {
+    const dirty = pending.size > 0
+    if (get().dirty !== dirty) set({ dirty })
+  }
+  let flushTimer: ReturnType<typeof setTimeout> | null = null
+  const flushAll = async (): Promise<void> => {
+    if (flushTimer) {
+      clearTimeout(flushTimer)
+      flushTimer = null
+    }
+    const entries = [...pending.entries()]
+    pending.clear()
+    syncDirty()
+    await Promise.all(entries.map(([p, t]) => queueWrite(p, t)))
+    // Also drain writes queued OUTSIDE the buffer (properties, task toggles) so a
+    // pre-close flush really means "everything is on disk", not just typed edits.
+    await Promise.all([...writeChains.values()])
+  }
+  const scheduleFlush = (delay = 600): void => {
+    if (flushTimer) clearTimeout(flushTimer)
+    flushTimer = setTimeout(() => void flushAll(), delay)
+  }
+
+  // Bumped on every vault (re)load. A hydration pass captures its generation and
+  // stops the moment it goes stale, so switching vaults mid-load can't pour the old
+  // vault's notes into the new one's state.
+  let loadGen = 0
+
+  /**
+   * Read the rest of the vault in the background, chunk by chunk.
+   *
+   * `texts` and `parsed` are mutated IN PLACE here (the documented hot-path
+   * convention) rather than spread per chunk — copying a growing map once per batch
+   * is quadratic in the note count, which is exactly the wrong shape for the case
+   * this exists to fix. Consumers are driven by `textsTick`/`loadedCount` during the
+   * pass, then by one real index build at the end.
+   */
+  const hydrateVault = async (gen: number, paths: string[]): Promise<void> => {
+    for (let i = 0; i < paths.length; i += HYDRATE_CHUNK) {
+      if (gen !== loadGen) return // vault switched under us
+      const slice = paths.slice(i, i + HYDRATE_CHUNK)
+      const contents = await window.grantha.readNotesCached(slice)
+      if (gen !== loadGen) return
+      const { texts, parsed } = get()
+      // Notes the cache couldn't answer for, to hand back below. Parsing is ~20% of
+      // a cold start and almost none of it changes between launches, so the second
+      // and later launches on an unchanged vault do essentially none of it.
+      const fresh: { path: string; parsed: unknown }[] = []
+      for (const { path, text, parsed: cached } of contents) {
+        // Never clobber a note already in memory: it was either opened on demand
+        // (ensureLoaded) or edited while the rest of the vault streamed in.
+        if (texts[path] !== undefined) continue
+        texts[path] = text
+        if (cached) {
+          parsed[path] = cached as ParsedNote
+        } else {
+          const pn = parseNote(path, text)
+          parsed[path] = pn
+          fresh.push({ path, parsed: pn })
+        }
+      }
+      if (fresh.length) void window.grantha.saveParseCache(fresh)
+      set({ texts, textsTick: get().textsTick + 1, loadedCount: Object.keys(texts).length })
+    }
+    if (gen !== loadGen) return
+    // One index build for the whole vault, once. Swapping `parsed` for a fresh object
+    // here is what tells identity-comparing consumers that the vault is complete.
+    const { texts, parsed } = get()
+    set({
+      parsed: { ...parsed },
+      parsedChanges: changed(null),
+      index: buildIndex(parsed, texts),
+      vaultLoading: false,
+      loadedCount: Object.keys(texts).length
+    })
+    publishVaultWords(parsed)
+  }
+
+  /** Load an opened workspace's notes + bases into state, resetting navigation. Shared
+   *  by bootstrap / openWorkspace / switchVault so a vault swap always lands cleanly. */
+  const applyWorkspace = async (ws: Workspace): Promise<void> => {
+    const gen = ++loadGen
+    // Drop anything still queued for the previous vault: a buffered write or a
+    // debounced index/flush that fired after the swap would land on the new vault.
+    pending.clear()
+    dirtyPaths.clear()
+    if (indexTimer) clearTimeout(indexTimer)
+    if (flushTimer) clearTimeout(flushTimer)
+    indexTimer = null
+    flushTimer = null
+    resetSpell() // the new vault has its own spellcheck ignore list
+    clearScanCache() // query scan cache entries belong to the previous vault
+    clearTodoCache() // …and so do the cached per-note todo lists
+    clearSearchCache() // …the cached searchable bodies
+    clearSimilarCache() // …and the TF-IDF term vectors
+
+    // Home is today's journal unless the user opted out. Landing on ws.files[0]
+    // — whatever sorts first — is arbitrary and gives the app no front door.
+    const home = localStorage.getItem('grantha-home') !== 'last'
+    const today = dailyPath(todayISO())
+
+    // Read ONLY the note we're about to show, then paint. The file tree comes from
+    // `ws.files` (already stat'd by the workspace open), so the vault is navigable
+    // immediately; everything else streams in behind this. When the journal is home
+    // that note is TODAY's — otherwise the one note we block the first paint on is
+    // the one note we're not about to render.
+    const first =
+      home && ws.files.some((f) => f.path === today) ? today : ws.files[0]?.path
+    const texts: Record<string, string> = {}
+    const parsed: Record<string, ParsedNote> = {}
+    if (first) {
+      const content = await window.grantha.readNote(first)
+      if (content !== null) {
+        texts[first] = content.text
+        parsed[first] = parseNote(first, content.text)
+      }
+    }
+    if (gen !== loadGen) return
+    set({
+      workspace: ws,
+      files: ws.files,
+      texts,
+      parsed,
+      parsedChanges: changed(null),
+      index: buildIndex(parsed, texts),
+      loading: false,
+      vaultLoading: ws.files.length > 1,
+      loadedCount: Object.keys(texts).length,
+      totalCount: ws.files.length,
+      dirty: false,
+      history: home
+        ? [{ kind: 'view', view: 'journal' }]
+        : first
+          ? [{ kind: 'note', path: first }]
+          : [],
+      histIndex: home || first ? 0 : -1,
+      sidePanes: [],
+      activePath: first ?? null,
+      view: home ? 'journal' : 'editor'
+    })
+
+    // Per-vault side data is small and independent of the note bodies — fetch it
+    // alongside the hydration rather than gating the first paint on it.
+    const rest = ws.files.map((f) => f.path).filter((p) => p !== first)
+    const hydrating = hydrateVault(gen, rest)
+
+    const bases = await loadWorkspaceBases()
+    if (gen !== loadGen) return
+    set({ bases, activeBaseId: bases[0]?.id ?? null })
+    const canvases = await window.grantha.listCanvases()
+    if (gen !== loadGen) return
+    set({ canvases, activeCanvasPath: canvases[0]?.path ?? null })
+    await get().reloadCustomCss()
+    await hydrating
+  }
+
+  /**
+   * Guarantee a note's text is in memory. During hydration a note the user clicks may
+   * not have been read yet — without this the editor would open it blank and then pop
+   * in seconds later.
+   */
+  const ensureLoaded = async (path: string): Promise<void> => {
+    if (get().texts[path] !== undefined) return
+    const content = await window.grantha.readNote(path)
+    if (content === null) return
+    const texts = get().texts
+    if (texts[path] !== undefined) return // hydration or an edit beat us to it
+    texts[path] = content.text
+    set({
+      texts,
+      textsTick: get().textsTick + 1,
+      parsed: { ...get().parsed, [path]: parseNote(path, content.text) },
+      parsedChanges: changed([path]),
+      loadedCount: Object.keys(texts).length
+    })
+  }
+  /** True if `path` has an unsaved buffered edit (used to avoid watcher clobber). */
+  const isPending = (path: string): boolean => pending.has(path)
+
+  /** Show a note in the main pane (no history record). */
+  const activateNote = (path: string): void => {
+    if (get().dirty) void flushAll()
+    void ensureLoaded(path) // may still be streaming in — don't open it blank
+    set({ activePath: path, view: 'editor' })
+  }
+
+  /** Sibling note paths in a folder, ordered by `_order` then name. */
+  const siblingPaths = (folder: string): string[] => {
+    const { files, parsed } = get()
+    const orderOf = (p: string): number => {
+      const o = parsed[p]?.frontmatter._order
+      return typeof o === 'number' ? o : Number.MAX_SAFE_INTEGER
+    }
+    return files
+      .filter((f) => dirname(f.path) === folder)
+      .sort((a, b) => orderOf(a.path) - orderOf(b.path) || a.name.localeCompare(b.name))
+      .map((f) => f.path)
+  }
+
+  /** Persist a sequential `_order` on the given paths (only where it changed). */
+  const persistOrder = async (ordered: string[]): Promise<void> => {
+    for (let k = 0; k < ordered.length; k++) {
+      const p = ordered[k]
+      if (get().parsed[p]?.frontmatter._order !== k) {
+        await get().setNoteProperties(p, { ...getFrontmatter(get().texts[p] ?? ''), _order: k })
+      }
+    }
+  }
+
+  const sameEntry = (a: HistEntry | undefined, b: HistEntry): boolean =>
+    !!a &&
+    a.kind === b.kind &&
+    (a.kind === 'note'
+      ? a.path === (b as { path: string }).path
+      : a.view === (b as { view: ViewMode }).view &&
+        // normalize: `undefined` (field omitted) and `null` are the same step
+        (a.baseId ?? null) === ((b as { baseId?: string | null }).baseId ?? null) &&
+        (a.tag ?? null) === ((b as { tag?: string | null }).tag ?? null) &&
+        (a.canvasPath ?? null) === ((b as { canvasPath?: string | null }).canvasPath ?? null))
+
+  /** Longest back/forward history kept; older steps fall off the front. */
+  const HISTORY_MAX = 200
+  /** Push a step (note or view) onto the history, truncating any forward entries. */
+  const pushHistory = (entry: HistEntry): void => {
+    const { history, histIndex } = get()
+    const trimmed = history.slice(0, histIndex + 1)
+    if (sameEntry(trimmed[trimmed.length - 1], entry)) return
+    const next = [...trimmed, entry].slice(-HISTORY_MAX)
+    set({ history: next, histIndex: next.length - 1 })
+  }
+  const recordHistory = (path: string): void => pushHistory({ kind: 'note', path })
+
+  /** Drop history steps for a deleted note (Back must not resurrect it), deduping
+   *  any now-adjacent identical steps and keeping histIndex on the same entry. */
+  const pruneHistory = (
+    history: HistEntry[],
+    histIndex: number,
+    deadPath: string
+  ): { history: HistEntry[]; histIndex: number } => {
+    const kept: HistEntry[] = []
+    let idx = histIndex
+    for (let i = 0; i < history.length; i++) {
+      const h = history[i]
+      const drop =
+        (h.kind === 'note' && h.path === deadPath) || sameEntry(kept[kept.length - 1], h)
+      if (drop) {
+        if (i <= histIndex) idx--
+      } else {
+        kept.push(h)
+      }
+    }
+    return { history: kept, histIndex: Math.min(Math.max(idx, 0), kept.length - 1) }
+  }
+
+  /** Point history steps for a renamed note at its new path. */
+  const remapHistory = (history: HistEntry[], oldPath: string, newPath: string): HistEntry[] =>
+    history.map((h) => (h.kind === 'note' && h.path === oldPath ? { ...h, path: newPath } : h))
+
+  /** Apply a history step to the view state (no new history record). */
+  const restoreEntry = (entry: HistEntry): void => {
+    if (get().dirty) void flushAll()
+    if (entry.kind === 'note') {
+      void ensureLoaded(entry.path) // may still be streaming in — don't open it blank
+      set({ activePath: entry.path, view: 'editor' })
+    } else {
+      set({
+        view: entry.view,
+        ...(entry.view === 'database' && entry.baseId ? { activeBaseId: entry.baseId } : {}),
+        ...(entry.view === 'tags' ? { activeTag: entry.tag ?? null } : {}),
+        ...(entry.view === 'canvas' && entry.canvasPath ? { activeCanvasPath: entry.canvasPath } : {})
+      })
+    }
+  }
+
+  return {
+    workspace: null,
+    recentVaults: [],
+    files: [],
+    texts: {},
+    textsTick: 0,
+    vaultLoading: false,
+    loadedCount: 0,
+    totalCount: 0,
+    parsed: {},
+    parsedChanges: { rev: 0, paths: null },
+    index: new VaultIndex([], {}),
+    history: [],
+    histIndex: -1,
+    sidePanes: [],
+    activePath: null,
+    view: 'editor',
+    findRequest: null,
+    bases: [],
+    activeBaseId: null,
+    canvases: [],
+    activeCanvasPath: null,
+    activeTag: null,
+    modal: null,
+    paletteOpen: false,
+    sidebarOpen: localStorage.getItem('grantha-sidebar') !== 'closed',
+    rightbarOpen: localStorage.getItem('grantha-rightbar') !== 'closed',
+    sidebarWidth: clampPanel(Number(localStorage.getItem('grantha-sidebar-w')) || 260, 'sidebar'),
+    rightbarWidth: clampPanel(Number(localStorage.getItem('grantha-rightbar-w')) || 280, 'rightbar'),
+    // Zen is deliberately NOT persisted: it's a posture for the next hour, not a
+    // setting — booting into a chromeless window would just look broken.
+    zen: false,
+    theme: (localStorage.getItem('grantha-theme') as ThemeName | null) ?? 'dark',
+    accent: localStorage.getItem('grantha-accent') ?? 'indigo',
+    customCss: null,
+    // Same Paper-implies-Serif default as setTheme, applied on boot.
+    editorFont:
+      localStorage.getItem('grantha-font') ??
+      (localStorage.getItem('grantha-theme') === 'paper' ? 'serif' : 'sans'),
+    editorFontSize: Number(localStorage.getItem('grantha-fontsize')) || 16,
+    indentGuides: (localStorage.getItem('grantha-guides') as IndentGuides | null) ?? 'plain',
+    spellcheck: localStorage.getItem('grantha-spellcheck') !== 'off',
+    smartLinkTitles: localStorage.getItem('grantha-smart-titles') !== 'off',
+    homeJournal: localStorage.getItem('grantha-home') !== 'last',
+    dirty: false,
+    loading: false,
+    saveError: null,
+
+    toggleTheme: () => {
+      // Cycle dark → paper → light → dark (palette command; Settings picks directly).
+      const cur = get().theme
+      get().setTheme(cur === 'dark' ? 'paper' : cur === 'paper' ? 'light' : 'dark')
+    },
+
+    setTheme: (theme) => {
+      localStorage.setItem('grantha-theme', theme)
+      // Paper implies Serif — but only as a DEFAULT. An explicit pick is recorded
+      // in localStorage (`setEditorFont` writes it), so its absence is what marks
+      // the font as still-default and therefore ours to suggest. Switching away
+      // hands the default back, so the pairing is never sticky.
+      const chosen = localStorage.getItem('grantha-font')
+      const editorFont = chosen ?? (theme === 'paper' ? 'serif' : 'sans')
+      set({ theme, editorFont })
+    },
+
+    setAccent: (accent) => {
+      localStorage.setItem('grantha-accent', accent)
+      set({ accent })
+    },
+
+    reloadCustomCss: async () => {
+      set({ customCss: await window.grantha.readCustomCss() })
+    },
+
+    dismissSaveError: () => set({ saveError: null }),
+
+    toggleSidebar: () => {
+      const sidebarOpen = !get().sidebarOpen
+      localStorage.setItem('grantha-sidebar', sidebarOpen ? 'open' : 'closed')
+      set({ sidebarOpen })
+    },
+
+    toggleRightbar: () => {
+      const rightbarOpen = !get().rightbarOpen
+      localStorage.setItem('grantha-rightbar', rightbarOpen ? 'open' : 'closed')
+      set({ rightbarOpen })
+    },
+
+    setSidebarWidth: (px) => {
+      const sidebarWidth = clampPanel(px, 'sidebar')
+      localStorage.setItem('grantha-sidebar-w', String(sidebarWidth))
+      set({ sidebarWidth })
+    },
+
+    setRightbarWidth: (px) => {
+      const rightbarWidth = clampPanel(px, 'rightbar')
+      localStorage.setItem('grantha-rightbar-w', String(rightbarWidth))
+      set({ rightbarWidth })
+    },
+
+    toggleZen: () => set({ zen: !get().zen }),
+
+    setEditorFont: (editorFont) => {
+      localStorage.setItem('grantha-font', editorFont)
+      set({ editorFont })
+    },
+
+    setIndentGuides: (indentGuides) => {
+      localStorage.setItem('grantha-guides', indentGuides)
+      set({ indentGuides })
+    },
+
+    setSpellcheck: (on) => {
+      localStorage.setItem('grantha-spellcheck', on ? 'on' : 'off')
+      set({ spellcheck: on })
+    },
+
+    setEditorFontSize: (editorFontSize) => {
+      localStorage.setItem('grantha-fontsize', String(editorFontSize))
+      set({ editorFontSize })
+    },
+
+    setHomeJournal: (homeJournal) => {
+      localStorage.setItem('grantha-home', homeJournal ? 'journal' : 'last')
+      set({ homeJournal })
+    },
+
+    setSmartLinkTitles: (smartLinkTitles) => {
+      localStorage.setItem('grantha-smart-titles', smartLinkTitles ? 'on' : 'off')
+      set({ smartLinkTitles })
+    },
+
+    openModal: (modal) => set({ modal }),
+    closeModal: () => set({ modal: null }),
+    setPalette: (paletteOpen) => set({ paletteOpen }),
+
+    openTag: (activeTag) => {
+      if (get().dirty) void get().saveActive()
+      set({ view: 'tags', activeTag })
+      pushHistory({ kind: 'view', view: 'tags', tag: activeTag })
+    },
+
+    newFromTemplate: async (templatePath, folder = '') => {
+      const tpl = (await window.grantha.readNote(templatePath))?.text ?? ''
+      const taken = new Set(get().files.map((f) => f.path.toLowerCase()))
+      const prefix = folder ? `${folder}/` : ''
+      let path = `${prefix}Untitled.md`
+      let i = 1
+      while (taken.has(path.toLowerCase())) path = `${prefix}Untitled ${i++}.md`
+      const text = applyTemplate(tpl, basename(path), new Date())
+      const created = await window.grantha.createNote(path, text)
+      if (created) {
+        await get().applyFileEvent({ type: 'add', file: created })
+        get().openNote(created.path)
+      }
+    },
+
+    applySupertag: async (notePath, tag) => {
+      const index = buildSupertagIndex(supertagsFromParsed(get().parsed))
+      const st = index.get(normTag(tag))
+      const display = st?.name ?? tag.replace(/^#/, '').trim()
+      const data = { ...getFrontmatter(get().texts[notePath] ?? '') }
+      const existing = Array.isArray(data.tags)
+        ? data.tags.map(String)
+        : typeof data.tags === 'string'
+          ? data.tags.split(/[,\s]+/).filter(Boolean)
+          : []
+      if (existing.some((t) => normTag(t) === normTag(display))) return // already an instance
+      data.tags = [...existing, display]
+      await get().setNoteProperties(notePath, data)
+    },
+
+    ensureEntity: async (name, tag) => {
+      const existing = resolveTarget(
+        name,
+        get().files.map((f) => f.path)
+      )
+      let path = existing
+      if (!path) {
+        const created = await window.grantha.createNote(pathForNewNote(name), '')
+        if (!created) return name
+        await get().applyFileEvent({ type: 'add', file: created })
+        path = created.path
+      }
+      await get().applySupertag(path, tag)
+      return path
+    },
+
+    createSupertag: async (name, opts) => {
+      const open = opts?.open !== false
+      const clean = name.replace(/^#/, '').trim().replace(/[/\\]/g, '-')
+      if (!clean) return null
+      const path = `${TAGS_DIR}/${clean}.md`
+      const existing = get().files.find((f) => f.path.toLowerCase() === path.toLowerCase())
+      if (existing) {
+        if (open) get().openNote(existing.path)
+        return existing.path
+      }
+      const created = await window.grantha.createNote(path, '---\nfields: {}\n---\n')
+      if (!created) return null
+      await get().applyFileEvent({ type: 'add', file: created })
+      if (open) get().openNote(created.path)
+      return created.path
+    },
+
+    removeSupertag: async (tag) => {
+      const norm = normTag(tag)
+      const st = buildSupertagIndex(supertagsFromParsed(get().parsed)).get(norm)
+      if (!st) return
+      await get().deleteNote(st.path)
+      // Drop the selection if it pointed at a tag that no longer exists anywhere;
+      // a tag nothing carries has no page left to show.
+      const stillUsed = Object.values(get().parsed).some((n) => n.tags.some((t) => normTag(t) === norm))
+      if (!stillUsed && get().activeTag && normTag(get().activeTag as string) === norm) set({ activeTag: null })
+    },
+
+    setSupertagFields: async (defPath, fields) => {
+      const data = { ...getFrontmatter(get().texts[defPath] ?? '') }
+      data.fields = fieldsToFrontmatter(fields)
+      await get().setNoteProperties(defPath, data)
+    },
+
+    applySupertagToFolder: async (folder, tag) => {
+      const notes = get().files.filter((f) => f.path.startsWith(folder + '/') && !f.path.startsWith(TAGS_DIR + '/'))
+      // Sequential: each applySupertag writes through immediately, so avoid racing the files.
+      for (const f of notes) await get().applySupertag(f.path, tag)
+    },
+
+    createSupertagFromFolder: async (folder) => {
+      const name = folder.split('/').pop() || folder
+      const tagPath = `${TAGS_DIR}/${name}.md`
+      const notes = get().files.filter((f) => f.path.startsWith(folder + '/'))
+
+      // Infer a field schema from the union of the folder notes' frontmatter keys.
+      const inferType = (v: unknown): FieldDef['type'] => {
+        if (typeof v === 'boolean') return 'checkbox'
+        if (typeof v === 'number') return 'number'
+        if (Array.isArray(v)) return 'list'
+        if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)) return 'date'
+        if (typeof v === 'string' && /^https?:\/\//i.test(v)) return 'url'
+        return 'text'
+      }
+      const fieldMap = new Map<string, FieldDef>()
+      for (const f of notes) {
+        const fm = getFrontmatter(get().texts[f.path] ?? '')
+        for (const [k, v] of Object.entries(fm)) {
+          if (k.startsWith('_') || k === 'tags' || k === 'pinned' || fieldMap.has(k)) continue
+          if (v === undefined || v === null || v === '') continue
+          fieldMap.set(k, { name: k, type: inferType(v) })
+        }
+      }
+      const fields = [...fieldMap.values()]
+
+      // Create the supertag definition (or update an existing one with the inferred fields).
+      const existing = get().files.find((x) => x.path.toLowerCase() === tagPath.toLowerCase())
+      let defPath = tagPath
+      if (existing) {
+        defPath = existing.path
+        await get().setSupertagFields(defPath, fields)
+      } else {
+        const text = replaceFrontmatter(`# ${name}\n`, { fields: fieldsToFrontmatter(fields) })
+        const created = await window.grantha.createNote(tagPath, text)
+        if (!created) return
+        await get().applyFileEvent({ type: 'add', file: created })
+      }
+
+      for (const f of notes) await get().applySupertag(f.path, name)
+      get().openNote(defPath)
+    },
+
+    applyTemplateToNote: async (notePath, templatePath) => {
+      const raw = (await window.grantha.readNote(templatePath))?.text ?? ''
+      const noteName = get().files.find((f) => f.path === notePath)?.name ?? basename(notePath)
+      const tpl = parseFrontmatter(applyTemplate(raw, noteName, new Date()))
+      const cur = parseFrontmatter(get().texts[notePath] ?? '')
+      // Template properties fill in; the note's own existing values win.
+      const mergedFm = { ...tpl.data, ...cur.data }
+      const combinedBody = [cur.body.trimEnd(), tpl.body.trim()].filter(Boolean).join('\n\n')
+      const text = replaceFrontmatter(combinedBody, mergedFm)
+      updateNoteState(notePath, text)
+      pending.delete(notePath)
+      syncDirty()
+      await queueWrite(notePath, text)
+    },
+
+    reorderTo: async (dragPath, dropPath) => {
+      const folder = dirname(dropPath)
+      if (dirname(dragPath) !== folder) return get().moveToFolder(dragPath, folder)
+      const siblings = siblingPaths(folder).filter((p) => p !== dragPath)
+      const at = siblings.indexOf(dropPath)
+      if (at < 0) return
+      siblings.splice(at, 0, dragPath)
+      await persistOrder(siblings)
+    },
+
+    moveToFolder: async (path, folder) => {
+      const name = basename(path)
+      const target = folder ? `${folder}/${name}` : name
+      await get().renameNote(path, target)
+    },
+
+    setBases: (bases) => {
+      void window.grantha.writeBases(bases)
+      const activeBaseId = bases.some((b) => b.id === get().activeBaseId)
+        ? get().activeBaseId
+        : (bases[0]?.id ?? null)
+      set({ bases, activeBaseId })
+    },
+
+    openBase: (id) => {
+      if (get().dirty) void get().saveActive()
+      set({ view: 'database', activeBaseId: id })
+      pushHistory({ kind: 'view', view: 'database', baseId: id })
+    },
+
+    refreshCanvases: async () => {
+      const canvases = await window.grantha.listCanvases()
+      const active = get().activeCanvasPath
+      set({
+        canvases,
+        activeCanvasPath: active && canvases.some((c) => c.path === active) ? active : (canvases[0]?.path ?? null)
+      })
+    },
+
+    openCanvasView: () => {
+      if (get().dirty) void get().saveActive()
+      const path = get().activeCanvasPath
+      set({ view: 'canvas' })
+      pushHistory({ kind: 'view', view: 'canvas', canvasPath: path })
+    },
+
+    openCanvas: (path) => {
+      if (get().dirty) void get().saveActive()
+      set({ view: 'canvas', activeCanvasPath: path })
+      pushHistory({ kind: 'view', view: 'canvas', canvasPath: path })
+    },
+
+    createCanvas: async (name, folder = '') => {
+      const clean = name.trim().replace(/\.canvas$/i, '') || 'Canvas'
+      const taken = new Set(get().canvases.map((c) => c.path.toLowerCase()))
+      const prefix = folder ? `${folder}/` : ''
+      let path = `${prefix}${clean}.canvas`
+      let i = 1
+      while (taken.has(path.toLowerCase())) path = `${prefix}${clean} ${i++}.canvas`
+      const created = await window.grantha.createCanvas(path)
+      if (!created) return
+      set({ canvases: [created, ...get().canvases], activeCanvasPath: created.path, view: 'canvas' })
+      pushHistory({ kind: 'view', view: 'canvas', canvasPath: created.path })
+    },
+
+    deleteCanvas: async (path) => {
+      const ok = await window.grantha.deleteCanvas(path)
+      if (!ok) return
+      const canvases = get().canvases.filter((c) => c.path !== path)
+      const activeCanvasPath = get().activeCanvasPath === path ? (canvases[0]?.path ?? null) : get().activeCanvasPath
+      set({ canvases, activeCanvasPath })
+    },
+
+    renameCanvas: async (path, name) => {
+      const trimmed = name.trim().replace(/\.canvas$/i, '')
+      if (!trimmed) return
+      const dir = dirname(path)
+      const newPath = trimmed.includes('/') ? `${trimmed}.canvas` : dir ? `${dir}/${trimmed}.canvas` : `${trimmed}.canvas`
+      if (newPath === path) return
+      const meta = await window.grantha.renameCanvas(path, newPath)
+      if (!meta) return
+      set({
+        canvases: get().canvases.map((c) => (c.path === path ? meta : c)),
+        activeCanvasPath: get().activeCanvasPath === path ? meta.path : get().activeCanvasPath
+      })
+    },
+
+    bootstrap: async () => {
+      set({ recentVaults: await window.grantha.getWorkspaces() })
+      const last = await window.grantha.getLastWorkspace()
+      if (!last) return
+      set({ loading: true })
+      try {
+        const ws = await window.grantha.loadWorkspace(last)
+        if (ws) await applyWorkspace(ws)
+      } finally {
+        set({ loading: false }) // never leave the loading screen stuck on a failure
+      }
+    },
+
+    openWorkspace: async () => {
+      set({ loading: true })
+      try {
+        const ws = await window.grantha.openWorkspace()
+        if (ws) await applyWorkspace(ws)
+      } finally {
+        set({ loading: false })
+      }
+      set({ recentVaults: await window.grantha.getWorkspaces() })
+    },
+
+    openDemoVault: async () => {
+      set({ loading: true })
+      try {
+        const ws = await window.grantha.openDemoVault()
+        if (ws) await applyWorkspace(ws)
+      } finally {
+        set({ loading: false })
+      }
+      set({ recentVaults: await window.grantha.getWorkspaces() })
+    },
+
+    switchVault: async (root) => {
+      if (get().workspace?.root === root) return
+      if (get().dirty) await flushAll() // don't lose unsaved edits on swap
+      set({ loading: true })
+      try {
+        const ws = await window.grantha.loadWorkspace(root)
+        if (ws) await applyWorkspace(ws)
+      } finally {
+        set({ loading: false })
+      }
+      set({ recentVaults: await window.grantha.getWorkspaces() })
+    },
+
+    forgetVault: async (root) => {
+      const remaining = await window.grantha.forgetWorkspace(root)
+      set({ recentVaults: remaining })
+    },
+
+    reloadVault: async () => {
+      const ws = get().workspace
+      if (!ws) return
+      const fresh = await window.grantha.loadWorkspace(ws.root)
+      if (!fresh) return
+      const gen = ++loadGen
+      const exists = (p: string | null | undefined): boolean => !!p && fresh.files.some((f) => f.path === p)
+      const active = get().activePath
+      const keep = exists(active) ? active! : (fresh.files[0]?.path ?? null)
+      // Re-read from disk, keeping the user where they are. Same streaming shape as a
+      // fresh open: the note in front of them first, the rest behind it.
+      const texts: Record<string, string> = {}
+      const parsed: Record<string, ParsedNote> = {}
+      if (keep) {
+        const content = await window.grantha.readNote(keep)
+        if (content !== null) {
+          texts[keep] = content.text
+          parsed[keep] = parseNote(keep, content.text)
+        }
+      }
+      if (gen !== loadGen) return
+      clearScanCache()
+      clearTodoCache()
+      clearSearchCache()
+      clearSimilarCache()
+      set({
+        workspace: fresh,
+        files: fresh.files,
+        texts,
+        parsed,
+        parsedChanges: changed(null),
+        index: buildIndex(parsed, texts),
+        vaultLoading: fresh.files.length > 1,
+        loadedCount: Object.keys(texts).length,
+        totalCount: fresh.files.length,
+        activePath: keep,
+        sidePanes: get().sidePanes.filter((sp) => sp.kind === 'pdf' || exists(sp.path))
+      })
+      await hydrateVault(gen, fresh.files.map((f) => f.path).filter((p) => p !== keep))
+    },
+
+    openNote: (path) => {
+      activateNote(path)
+      recordHistory(path)
+    },
+
+    openNoteWithFind: (path, query) => {
+      activateNote(path)
+      recordHistory(path)
+      set({ findRequest: { path, query } })
+    },
+
+    clearFindRequest: () => set({ findRequest: null }),
+
+    openInSidePane: (path) => {
+      const panes = get().sidePanes
+      if (panes.some((p) => p.kind === 'note' && p.path === path)) return // already open in a split
+      void ensureLoaded(path) // may still be streaming in — don't open it blank
+      set({ sidePanes: [...panes, { kind: 'note', path }] })
+    },
+
+    previewInSidePane: (path) => {
+      const panes = get().sidePanes
+      if (panes.some((p) => p.kind === 'note' && p.path === path)) return // already showing
+      void ensureLoaded(path)
+      // REUSE the last note pane rather than appending. Clicking through a list of
+      // results is browsing, not assembling a workspace: stacking a pane per click
+      // is the same "jumping around" this is meant to avoid. ⌘-click still adds a
+      // pane when you do want to line several up. PDF panes are never displaced.
+      const last = panes.map((p) => p.kind).lastIndexOf('note')
+      if (last === -1) return set({ sidePanes: [...panes, { kind: 'note', path }] })
+      const next = [...panes]
+      next[last] = { kind: 'note', path }
+      set({ sidePanes: next })
+    },
+
+    goBack: () => {
+      const { history, histIndex } = get()
+      if (histIndex <= 0) return
+      const i = histIndex - 1
+      set({ histIndex: i })
+      restoreEntry(history[i])
+    },
+
+    goForward: () => {
+      const { history, histIndex } = get()
+      if (histIndex >= history.length - 1) return
+      const i = histIndex + 1
+      set({ histIndex: i })
+      restoreEntry(history[i])
+    },
+
+    openView: (view) => {
+      if (get().dirty) void get().saveActive()
+      set({ view })
+      if (view !== 'editor') pushHistory({ kind: 'view', view })
+    },
+
+    openPdf: (path, highlightId) => {
+      const panes = get().sidePanes
+      const already = panes.some((p) => p.kind === 'pdf' && p.path === path)
+      if (!already) set({ sidePanes: [...panes, { kind: 'pdf', path }] })
+      if (highlightId) setTimeout(() => pdfBus.goto(highlightId), already ? 50 : 600)
+    },
+
+    closeSidePane: (index) => {
+      const panes = get().sidePanes
+      if (!panes.length) return
+      const at = index ?? panes.length - 1
+      set({ sidePanes: panes.filter((_, i) => i !== at) })
+    },
+
+    promoteSidePane: (index) => {
+      const panes = get().sidePanes
+      const pane = panes[index]
+      if (!pane || pane.kind !== 'note') return // a PDF has no main-pane renderer
+      set({ sidePanes: panes.filter((_, i) => i !== index) })
+      // Through openNote, so whatever the main pane was showing (a base, a query,
+      // the journal) is one Back away — promoting is a step forward, not a swap.
+      get().openNote(pane.path)
+    },
+
+    editNote: (path, text) => {
+      updateText(path, text)
+      pending.set(path, text)
+      syncDirty()
+      scheduleFlush()
+    },
+
+    setNoteBody: (path, body) => {
+      const raw = parseFrontmatter(get().texts[path] ?? '').raw
+      get().editNote(path, raw ? `${raw}\n${body}` : body)
+    },
+
+    editActive: (text) => {
+      const path = get().activePath
+      if (path) get().editNote(path, text)
+    },
+
+    saveActive: () => flushAll(),
+
+    hasPendingEdit: (path) => pending.has(path),
+
+    setNoteProperties: async (path, data) => {
+      const cur = get().texts[path] ?? ''
+      const text = replaceFrontmatter(cur, data)
+      updateNoteState(path, text)
+      pending.delete(path)
+      syncDirty()
+      await queueWrite(path, text)
+    },
+
+    setTableWidths: async (path, index, widths) => {
+      const data = { ...getFrontmatter(get().texts[path] ?? '') }
+      const tw = { ...((data._tableWidths as Record<string, number[]>) ?? {}) }
+      tw[index] = widths
+      data._tableWidths = tw
+      await get().setNoteProperties(path, data)
+    },
+
+    togglePin: async (path) => {
+      const data = { ...getFrontmatter(get().texts[path] ?? '') }
+      if (data.pinned) delete data.pinned
+      else data.pinned = true
+      await get().setNoteProperties(path, data)
+    },
+
+    linkUnlinked: async (sourcePath, line, name) => {
+      const text = get().texts[sourcePath]
+      if (text === undefined) return
+      const lines = text.split('\n')
+      if (line < 0 || line >= lines.length) return
+      const next = wrapMention(lines[line], name)
+      if (next === lines[line]) return
+      lines[line] = next
+      get().editNote(sourcePath, lines.join('\n'))
+    },
+
+    linkAllUnlinked: async (path) => {
+      const refs = get().index.unlinkedReferences(path)
+      if (!refs.length) return
+      const name = refs[0].ref.raw
+      const bySource = new Map<string, number[]>()
+      for (const r of refs) bySource.set(r.sourcePath, [...(bySource.get(r.sourcePath) ?? []), r.line])
+      for (const [sp, lineNums] of bySource) {
+        const text = get().texts[sp]
+        if (text === undefined) continue
+        const lines = text.split('\n')
+        let changed = false
+        for (const ln of lineNums) {
+          if (ln < 0 || ln >= lines.length) continue
+          const next = wrapMention(lines[ln], name)
+          if (next !== lines[ln]) {
+            lines[ln] = next
+            changed = true
+          }
+        }
+        if (changed) get().editNote(sp, lines.join('\n'))
+      }
+    },
+
+    toggleTask: async (path, line) => {
+      const cur = get().texts[path]
+      if (cur === undefined) return
+      const lines = cur.split('\n')
+      const m = lines[line]?.match(/^(\s*- \[)([ xX])(\].*)$/)
+      if (!m) return
+      lines[line] = m[1] + (m[2].toLowerCase() === 'x' ? ' ' : 'x') + m[3]
+      const text = lines.join('\n')
+      // Write straight through (not the debounced editor buffer) so a checkbox toggle
+      // survives an immediate app close.
+      updateNoteState(path, text)
+      pending.delete(path)
+      syncDirty()
+      await queueWrite(path, text)
+    },
+
+    navigate: async (raw, side = false) => {
+      // Real filenames first (immediate); then frontmatter aliases via the index.
+      const existing =
+        resolveTarget(
+          raw,
+          get().files.map((f) => f.path)
+        ) ?? get().index.resolvePath(raw)
+      if (existing) {
+        side ? get().openInSidePane(existing) : get().openNote(existing)
+        return
+      }
+      // An unresolved ISO-date link is a journal day, not a root note: [[2026-07-15]]
+      // creates/opens Daily/2026/07/2026-07-15.md (natural-language `[[` dates land here).
+      if (isValidISO(raw.trim())) {
+        const daily = await get().ensureDailyNote(raw.trim())
+        side ? get().openInSidePane(daily) : get().openNote(daily)
+        return
+      }
+      const path = pathForNewNote(raw)
+      // Start with an empty body — the title comes from the filename (shown at the top),
+      // so the note opens as a blank paragraph ready for typing.
+      const created = await window.grantha.createNote(path, '')
+      if (created) {
+        await get().applyFileEvent({ type: 'add', file: created })
+        side ? get().openInSidePane(created.path) : get().openNote(created.path)
+      } else {
+        set({ saveError: `Couldn't create ${path}` })
+      }
+    },
+
+    ensureDailyNote: async (iso) => {
+      const path = dailyPath(iso)
+      const exists = get().files.some((f) => f.path === path)
+      const empty = !(get().texts[path] ?? '').trim()
+      // Seed from `Templates/Journal.md` when the day is brand-new or still blank.
+      if (!exists || empty) {
+        // Match a `Templates/` note named "Journal" or "Journal Template".
+        const tpl = get().files.find(
+          (f) => f.path.startsWith('Templates/') && /^journal( template)?$/i.test(f.name)
+        )
+        const seed = tpl
+          ? applyTemplate((await window.grantha.readNote(tpl.path))?.text ?? '', basename(path), new Date())
+          : ''
+        if (!exists) {
+          const created = await window.grantha.createNote(path, seed)
+          if (created) await get().applyFileEvent({ type: 'add', file: created })
+        } else if (seed) {
+          get().editNote(path, seed)
+        }
+      }
+      return path
+    },
+
+    addTaskToToday: async (text) => {
+      const task = text.trim()
+      if (!task) return
+      const path = await get().ensureDailyNote(todayISO())
+      // The day may not have streamed in yet (hydration) — read it rather than
+      // append to an empty string and wipe the entry.
+      if (get().texts[path] === undefined) {
+        const content = await window.grantha.readNote(path)
+        if (content !== null && get().texts[path] === undefined) updateNoteState(path, content.text)
+      }
+      const body = parseFrontmatter(get().texts[path] ?? '').body
+      const line = `- [ ] ${task}`
+      get().setNoteBody(path, body.trimEnd() ? `${body.trimEnd()}\n${line}\n` : `${line}\n`)
+      // Straight to disk: quick capture is used mid-thought and then abandoned —
+      // it must survive a quit before the 600ms debounce fires.
+      await get().saveActive()
+    },
+
+    applyFileEvent: async (event) => {
+      const evPath = event.type === 'unlink' ? event.path : event.type === 'rename' ? event.path : event.file.path
+      // Non-markdown vault files route to their own reloaders (the watcher forwards
+      // canvas / bases / custom-css / asset events too, not just notes).
+      if (evPath === '.verso/custom.css') {
+        await get().reloadCustomCss()
+        return
+      }
+      if (evPath === '.verso/bases.json') {
+        const bases = normalizeBases(await window.grantha.readBases())
+        const activeBaseId = bases.some((b) => b.id === get().activeBaseId)
+          ? get().activeBaseId
+          : (bases[0]?.id ?? null)
+        set({ bases, activeBaseId })
+        return
+      }
+      if (evPath.toLowerCase().endsWith('.canvas')) {
+        await get().refreshCanvases()
+        return
+      }
+      if (!evPath.toLowerCase().endsWith('.md')) return // asset events don't affect note state
+
+      if (event.type === 'unlink') {
+        dropFromScanCache(event.path)
+        dropFromSearchCache(event.path)
+        // Merge onto the latest state (a functional update) so concurrent events
+        // can't clobber each other.
+        set((state) => {
+          const files = state.files.filter((f) => f.path !== event.path)
+          const texts = { ...state.texts }
+          const parsed = { ...state.parsed }
+          delete texts[event.path]
+          delete parsed[event.path]
+          return {
+            files,
+            texts,
+            parsed,
+            parsedChanges: changed([event.path]),
+            activePath: state.activePath === event.path ? (files[0]?.path ?? null) : state.activePath,
+            sidePanes: state.sidePanes.filter((sp) => sp.path !== event.path),
+            // Back must not resurrect the dead note (one keystroke would recreate it).
+            ...pruneHistory(state.history, state.histIndex, event.path)
+          }
+        })
+        // Index rebuild goes through the debounce: a sync burst deleting N files
+        // then costs one rebuild, not N.
+        dirtyPaths.add(event.path)
+        scheduleIndexRebuild()
+        return
+      }
+
+      // An external move: swap the old path for the new one, keeping identity (the
+      // open note / splits follow the file instead of resetting).
+      if (event.type === 'rename') {
+        dropFromScanCache(event.oldPath)
+        dropFromSearchCache(event.oldPath)
+        // An unsaved buffer follows the file — and wins over what's on disk, so a
+        // keystroke typed right around the move isn't clobbered by this event.
+        if (pending.has(event.oldPath)) {
+          pending.set(event.path, pending.get(event.oldPath)!)
+          pending.delete(event.oldPath)
+        }
+        const keepLocal = isPending(event.path)
+        const content = await window.grantha.readNote(event.path)
+        set((state) => {
+          const texts = { ...state.texts }
+          const parsed = { ...state.parsed }
+          const local = keepLocal ? (state.texts[event.oldPath] ?? state.texts[event.path]) : undefined
+          delete texts[event.oldPath]
+          delete parsed[event.oldPath]
+          let files = state.files.filter((f) => f.path !== event.oldPath)
+          if (content !== null) {
+            const text = local ?? content.text
+            texts[event.path] = text
+            parsed[event.path] = parseNote(event.path, text)
+            const meta = event.file ?? { path: event.path, name: basename(event.path), mtime: 0 }
+            files = [...files.filter((f) => f.path !== event.path), meta]
+          }
+          const moved = content !== null
+          return {
+            files,
+            texts,
+            parsed,
+            parsedChanges: changed([event.oldPath, event.path]),
+            activePath:
+              state.activePath === event.oldPath
+                ? moved
+                  ? event.path
+                  : (files[0]?.path ?? null)
+                : state.activePath,
+            sidePanes: moved
+              ? state.sidePanes.map((sp) => (sp.path === event.oldPath ? { ...sp, path: event.path } : sp))
+              : state.sidePanes.filter((sp) => sp.path !== event.oldPath),
+            ...(moved
+              ? { history: remapHistory(state.history, event.oldPath, event.path) }
+              : pruneHistory(state.history, state.histIndex, event.oldPath))
+          }
+        })
+        dirtyPaths.add(event.oldPath)
+        dirtyPaths.add(event.path)
+        scheduleIndexRebuild()
+        return
+      }
+
+      const { file } = event
+      // Don't stomp a buffer with unsaved edits.
+      if (event.type === 'change' && isPending(file.path)) return
+      // Read first (this awaits), THEN merge onto the freshest state — otherwise
+      // a burst of adds would each start from the same stale snapshot and overwrite
+      // one another, so only the last few would survive.
+      const content = await window.grantha.readNote(file.path)
+      if (content === null) return
+      let deferredRebuild = false
+      set((state) => {
+        // Re-check after the await: an edit may have started while we were reading.
+        if (event.type === 'change' && isPending(file.path)) return {}
+        const texts = { ...state.texts, [file.path]: content.text }
+        const note = parseNote(file.path, content.text)
+        const parsed = { ...state.parsed, [file.path]: note }
+        const known = state.files.some((f) => f.path === file.path)
+        const files = known
+          ? state.files.map((f) => (f.path === file.path ? file : f))
+          : [...state.files, file]
+        // A change to an existing note patches the index in O(1 note); a brand-new
+        // file (or an alias shift, which withContentChanges rejects) defers to the
+        // debounced rebuild so a sync burst costs one rebuild, not one per file.
+        const incremental =
+          event.type === 'change' && known ? state.index.withContentChanges([note], texts) : null
+        deferredRebuild = !incremental
+        return { files, texts, parsed, parsedChanges: changed([file.path]), index: incremental ?? state.index }
+      })
+      if (deferredRebuild) {
+        dirtyPaths.add(file.path)
+        scheduleIndexRebuild()
+      }
+    },
+
+    renameNote: async (oldPath, input) => {
+      const trimmed = input.trim().replace(/\.md$/i, '')
+      if (!trimmed) return
+      const dir = dirname(oldPath)
+      const newPath = trimmed.includes('/') ? `${trimmed}.md` : dir ? `${dir}/${trimmed}.md` : `${trimmed}.md`
+      if (newPath === oldPath) return
+
+      // Flush ALL buffers, not just the renamed note's: a referrer with a pending
+      // edit would otherwise re-flush its pre-rewrite text ~600ms from now and
+      // silently undo the link rewrite on disk.
+      await flushAll()
+      const created = await window.grantha.renameNote(oldPath, newPath)
+      if (!created) {
+        set({ saveError: `Couldn't rename "${basename(oldPath)}" — "${basename(newPath)}" already exists?` })
+        return
+      }
+      dropFromScanCache(oldPath)
+      dropFromSearchCache(oldPath)
+
+      try {
+        // Snapshot AFTER the awaits above so keystrokes typed meanwhile are included.
+        const state = get()
+        const oldAllPaths = state.files.map((f) => f.path)
+        // Compute every rewrite up front. The renamed note's own body may link to
+        // itself by its old name, so it's rewritten too.
+        const own = state.texts[oldPath] ?? ''
+        const rewrites = new Map<string, string>([[newPath, rewriteLinks(own, oldPath, newPath, oldAllPaths)]])
+        for (const [p, t] of Object.entries(state.texts)) {
+          if (p === oldPath) continue
+          const rewritten = rewriteLinks(t, oldPath, newPath, oldAllPaths)
+          if (rewritten !== t) rewrites.set(p, rewritten)
+        }
+        // An edit buffered during the rename follows the file / gets the rewrite
+        // applied, so its eventual flush can't undo what we're about to write.
+        if (pending.has(oldPath)) {
+          pending.set(newPath, rewriteLinks(pending.get(oldPath)!, oldPath, newPath, oldAllPaths))
+          pending.delete(oldPath)
+        }
+        for (const p of rewrites.keys()) {
+          if (p !== newPath && pending.has(p)) {
+            pending.set(p, rewriteLinks(pending.get(p)!, oldPath, newPath, oldAllPaths))
+          }
+        }
+        // Persist the changed files.
+        if (rewrites.get(newPath) !== own) await queueWrite(newPath, rewrites.get(newPath)!)
+        for (const [p, t] of rewrites) {
+          if (p !== newPath) await queueWrite(p, t)
+        }
+        // Merge onto the freshest state (watcher events / keystrokes may have landed
+        // mid-rename) and reparse only the notes that actually changed.
+        set((s) => {
+          const texts = { ...s.texts }
+          const parsed = { ...s.parsed }
+          delete texts[oldPath]
+          delete parsed[oldPath]
+          for (const [p, t] of rewrites) {
+            texts[p] = t
+            parsed[p] = parseNote(p, t)
+          }
+          const files = s.files.filter((f) => f.path !== oldPath && f.path !== newPath).concat(created)
+          return {
+            texts,
+            parsed,
+            // A rename rewrites links across arbitrarily many referrers.
+            parsedChanges: changed(null),
+            files,
+            index: buildIndex(parsed, texts),
+            activePath: s.activePath === oldPath ? newPath : s.activePath,
+            sidePanes: s.sidePanes.map((sp) => (sp.path === oldPath ? { ...sp, path: newPath } : sp)),
+            history: remapHistory(s.history, oldPath, newPath)
+          }
+        })
+        // Canvas cards point at notes by path — retarget any that referenced the old path.
+        for (const c of get().canvases) {
+          const doc = normalizeDoc(await window.grantha.readCanvas(c.path))
+          let changed = false
+          const nodes = doc.nodes.map((n) => {
+            if (n.type === 'file' && n.file === oldPath) {
+              changed = true
+              return { ...n, file: newPath }
+            }
+            return n
+          })
+          if (changed) await window.grantha.writeCanvas(c.path, { ...doc, nodes })
+        }
+      } catch (e) {
+        // The file moved but a referrer-rewrite failed partway through, so memory and
+        // disk may now disagree. Re-scan from disk to reconcile to a consistent state.
+        console.error('renameNote: link rewrite failed, reloading vault', e)
+        await get().reloadVault()
+      }
+    },
+
+    reorderNote: async (path, dir) => {
+      const siblings = siblingPaths(dirname(path))
+      const i = siblings.indexOf(path)
+      const j = i + dir
+      if (i < 0 || j < 0 || j >= siblings.length) return
+      ;[siblings[i], siblings[j]] = [siblings[j], siblings[i]]
+      await persistOrder(siblings)
+    },
+
+    deleteNote: async (path) => {
+      const ok = await window.grantha.deleteNote(path)
+      if (!ok) {
+        set({ saveError: `Couldn't delete ${path}` })
+        return
+      }
+      await get().applyFileEvent({ type: 'unlink', path })
+    },
+
+    duplicateNote: async (path) => {
+      const text = get().texts[path] ?? (await window.grantha.readNote(path))?.text ?? ''
+      const base = path.replace(/\.md$/i, '')
+      const taken = new Set(get().files.map((f) => f.path.toLowerCase()))
+      let np = `${base} copy.md`
+      let i = 2
+      while (taken.has(np.toLowerCase())) np = `${base} copy ${i++}.md`
+      const created = await window.grantha.createNote(np, text)
+      if (created) {
+        await get().applyFileEvent({ type: 'add', file: created })
+        get().openNote(created.path)
+      } else {
+        set({ saveError: `Couldn't duplicate ${path}` })
+      }
+    },
+
+    revealNote: async (path) => {
+      await window.grantha.revealNote(path)
+    }
+  }
+})
