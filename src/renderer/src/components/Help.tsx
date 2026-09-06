@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { KEYMAP } from '../lib/keymap'
+import { version } from '../../../../package.json'
 
 interface Row {
   /** Key combo or syntax (rendered as a chip). */
@@ -308,8 +309,7 @@ export function Help({ onClose }: { onClose: () => void }): React.JSX.Element {
           ))}
           {shown.length === 0 && <div className="help-empty">Nothing matches “{q}”.</div>}
           <div className="help-foot">
-            Everything is plain Markdown on disk — notes, frontmatter properties, tags and links are
-            all standard <code>.md</code>, so your vault stays portable.
+            Grantha v{version} — everything is plain Markdown on disk, so your vault stays portable.
           </div>
         </div>
       </div>
