@@ -663,6 +663,8 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .vault-loading-dot { animation: none; opacity: 0.7; }
+  .hl-rect.hl-flash { animation: none; }
+  .gallery-card { transition: border-color 0.1s; }
 }
 /* Inside the graph the notice floats over the canvas rather than displacing it. */
 .graph-wrap .vault-loading-note {

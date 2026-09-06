@@ -306,6 +306,16 @@ del {
   font-size: 13px;
   font-style: italic;
 }
+.empty-shortcut {
+  font-size: 11px;
+  color: var(--text-faint);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.5px;
+}
 /* Branded empty state shown when no note is open. */
 .empty-doc {
   display: flex;

@@ -482,6 +482,9 @@ body.resizing-col {
      when a vertical scrollbar appears or disappears (only matters with classic, space-
      taking scrollbars — e.g. "Show scroll bars: Always" or a mouse attached). */
   scrollbar-gutter: stable;
+  /* Account for the sticky FormatBar so anchor-link / TOC clicks don't land
+     behind the toolbar. */
+  scroll-padding-top: 48px;
 }
 
 .doc {

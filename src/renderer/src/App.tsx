@@ -321,9 +321,11 @@ function RightSidebar(): React.JSX.Element {
   return (
     <aside className="rightbar">
       <ResizeHandle side="right" width={rightbarWidth} onResize={setRightbarWidth} label="Resize right panel" />
-      <RightSection id="calendar" title="Calendar">
-        <Calendar onPick={(iso) => void ensureDailyNote(iso).then(openNote)} />
-      </RightSection>
+      {view === 'journal' && (
+        <RightSection id="calendar" title="Calendar">
+          <Calendar onPick={(iso) => void ensureDailyNote(iso).then(openNote)} />
+        </RightSection>
+      )}
       {view === 'journal' && <OnThisDay />}
       {view === 'editor' && activePath && (
         <>
@@ -344,6 +346,16 @@ function MainArea(): React.JSX.Element {
   const activePath = useStore((s) => s.activePath)
   const sidePanes = useStore((s) => s.sidePanes)
   const rightbarOpen = useStore((s) => s.rightbarOpen)
+  const navigate = useStore((s) => s.navigate)
+  const files = useStore((s) => s.files)
+
+  const uniqueUntitled = (): string => {
+    const taken = new Set(files.map((f) => f.path.toLowerCase()))
+    let name = 'Untitled.md'
+    let i = 1
+    while (taken.has(name.toLowerCase())) name = `Untitled ${i++}.md`
+    return name.replace(/\.md$/i, '')
+  }
 
   let content: React.ReactNode
   if (view === 'graph') content = <GraphView />
@@ -361,6 +373,10 @@ function MainArea(): React.JSX.Element {
         <div className="doc empty-doc">
           <img className="empty-logo" src="./logo-wordmark.png" alt="Grantha" />
           <p className="empty-note">Select or create a note from the sidebar.</p>
+          <button className="btn" onClick={() => void navigate(uniqueUntitled())}>
+            ＋ New note
+          </button>
+          <span className="empty-shortcut">⌘N</span>
         </div>
       </div>
     )
