@@ -1,6 +1,6 @@
 {
   "name": "grantha",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "//desktopName": "Pairs with linux.syncDesktopName in electron-builder.yml — without it Linux desktops can't associate running windows with the .desktop entry (wrong taskbar icon / no grouping).",
   "desktopName": "grantha.desktop",
   "description": "A local-first notebook app: outliner meets document, built on plain Markdown.",
