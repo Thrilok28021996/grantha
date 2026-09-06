@@ -405,7 +405,11 @@ export function Sidebar(): React.JSX.Element {
       <div className="search-wrap">
         <input
           className={'search' + (isQuery ? ' is-query' : '')}
-          placeholder="Search — or #tag, before:, prop:…"
+          placeholder={
+            files.length
+              ? `Search ${files.length.toLocaleString()} notes — #tag, [[link]], before:…`
+              : 'Search notes…'
+          }
           title="Plain words search names and text. Query syntax (#tag, [[link]], before:/after:, prop:key=value, -not, sort:, limit:) filters the vault."
           value={query}
           onChange={(e) => setQuery(e.target.value)}
