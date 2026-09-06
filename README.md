@@ -28,11 +28,11 @@ Everything is local. Per-vault data (like saved Bases) lives inside the vault it
 
 ## Works with your existing vault
 
-Point Grantha at any folder of Markdown files, including an existing **Obsidian** vault. It reads and writes the same plain `.md` files with YAML frontmatter and `[[wikilinks]]`, and keeps its own settings in a `.verso/` folder inside the vault, so it won't disturb your .obsidian/` configuration. Nothing is imported or converted -  quit Grantha and your notes are exactly where they always were.
+Point Grantha at any folder of Markdown files, including an existing **Obsidian** vault. It reads and writes the same plain `.md` files with YAML frontmatter and `[[wikilinks]]`, and keeps its own settings in a `.grantha/` folder inside the vault, so it won't disturb your `.obsidian/` configuration. Nothing is imported or converted — quit Grantha and your notes are exactly where they always were.
 
 ## Install
 
-Grab the latest release from the [Releases](https://github.com/ed-nico/verso_notes/releases) page:
+Grab the latest release from the [Releases](https://github.com/Thrilok28021996/grantha/releases) page:
 
 - **macOS** (Apple Silicon) — download the `.dmg` and drag Grantha into Applications.
   The app isn't notarized yet (no $99/yr Apple developer account), so macOS will say
@@ -51,8 +51,8 @@ Grab the latest release from the [Releases](https://github.com/ed-nico/verso_not
 Or build from source:
 
 ```bash
-git clone https://github.com/ed-nico/verso_notes.git
-cd verso_notes
+git clone https://github.com/Thrilok28021996/grantha.git
+cd grantha_notes
 npm install
 npm run dev          # run in development with hot reload
 npm run build:mac    # or: package a .dmg (Apple Silicon)
